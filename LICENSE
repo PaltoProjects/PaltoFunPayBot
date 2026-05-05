@@ -1,0 +1,57 @@
+Copyright (c) 2025 nik3ta (https://github.com/nik3ta)
+
+УСЛОВИЯ ИСПОЛЬЗОВАНИЯ / TERMS OF USE
+======================================
+
+RU (основная версия)
+---------------------
+
+1. РАЗРЕШЕНО:
+   - Использовать данное программное обеспечение в личных (некоммерческих) целях.
+   - Изучать, изменять и создавать производные работы (форки).
+   - Распространять форки и модификации при обязательном соблюдении п. 2.
+
+2. ОБЯЗАТЕЛЬНО при распространении форков/модификаций:
+   - Указывать оригинального автора: nik3ta (https://github.com/nik3ta)
+   - Давать ссылку на оригинальный репозиторий.
+   - Явно обозначить, что данная версия является производной работой.
+
+3. ЗАПРЕЩЕНО без письменного разрешения автора:
+   - Продавать, перепродавать или иным образом распространять данное ПО
+     (или его производные) в коммерческих целях.
+   - Использовать название «PaltoFunPayBot» или схожие в коммерческих
+     продуктах без письменного разрешения автора.
+   - Снимать или изменять данное уведомление об авторских правах.
+
+4. ПО предоставляется «КАК ЕСТЬ», без каких-либо гарантий.
+   Автор не несёт ответственности за любой ущерб, возникший в результате
+   использования данного ПО.
+
+По вопросам коммерческого использования: https://github.com/nik3ta
+
+
+EN (translation for reference)
+--------------------------------
+
+1. PERMITTED:
+   - Use this software for personal (non-commercial) purposes.
+   - Study, modify, and create derivative works (forks).
+   - Distribute forks and modifications provided that section 2 is followed.
+
+2. REQUIRED when distributing forks/modifications:
+   - Credit the original author: nik3ta (https://github.com/nik3ta)
+   - Include a link to the original repository.
+   - Clearly state that the distributed version is a derivative work.
+
+3. PROHIBITED without the author's written permission:
+   - Selling, reselling, or otherwise distributing this software
+     (or its derivatives) for commercial purposes.
+   - Using the name "PaltoFunPayBot" or similar names in commercial
+     products without written permission from the author.
+   - Removing or altering this copyright notice.
+
+4. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+   The author shall not be liable for any damages arising from the use
+   of this software.
+
+For commercial licensing inquiries: https://github.com/nik3ta
