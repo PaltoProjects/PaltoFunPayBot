@@ -293,7 +293,7 @@ class ResponseTemplatesSettings(BaseModel):
 
 class Settings(BaseModel):
     """Корневая модель всех настроек бота."""
-    version: str = "0.2.0"
+    version: str = "1.0"
     setup_completed: bool = False
 
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
