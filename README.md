@@ -83,7 +83,7 @@
 ### Установка
 
 ```bash
-git clone https://github.com/твой-ник/PaltoFunPayBot.git
+git clone https://github.com/PaltoProjects/PaltoFunPayBot.git
 cd PaltoFunPayBot
 
 python -m venv venv
@@ -121,7 +121,7 @@ python main.py
 
 ```bash
 sudo apt install -y python3 python3-venv python3-pip git
-git clone https://github.com/твой-ник/PaltoFunPayBot.git /opt/funpaybot
+git clone https://github.com/PaltoProjects/PaltoFunPayBot.git /opt/funpaybot
 cd /opt/funpaybot
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
