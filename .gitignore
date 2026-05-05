@@ -1,0 +1,68 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Виртуальные окружения ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# ── Секреты и конфиги ─────────────────────────────────────────────────────────
+.env
+.env.*
+data/config.json
+data/config.broken.json
+
+# ── Данные и состояния ────────────────────────────────────────────────────────
+data/logs/
+data/greeted.json
+data/ai_pending.json
+data/auto_withdraw.json
+data/auto_deactivated.json
+data/low_stock_notified.json
+data/*.db
+data/*.sqlite
+data/*.db-shm
+data/*.db-wal
+data/delivery_files/
+
+# ── Сохраняем структуру data/ ────────────────────────────────────────────────
+!data/.gitkeep
+!data/logs/.gitkeep
+!data/delivery_files/.gitkeep
+
+# ── Диагностические скрипты ──────────────────────────────────────────────────
+diag_funpay*.py
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Логи ──────────────────────────────────────────────────────────────────────
+*.log
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+
+# ── Прочее ────────────────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
