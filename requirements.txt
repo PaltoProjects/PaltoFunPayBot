@@ -1,0 +1,28 @@
+# Telegram bot
+aiogram>=3.4.0,<4.0.0
+# Поддержка прокси с авторизацией для aiogram
+aiohttp-socks>=0.8.0
+
+# FunPay API — встроена в проект (форк из FunPayCardinal с исправлениями).
+# ВАЖНО: жёстко требуется requests==2.28.1, beautifulsoup4 для парсинга
+requests==2.28.1
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Конфиги и валидация
+pydantic>=2.0.0
+
+# Логи
+loguru>=0.7.0
+
+# HTTP / прокси-валидация
+aiohttp>=3.9.0
+
+# Системная информация (/sys команда)
+psutil>=5.9.0
+
+# Утилиты
+python-dotenv>=1.0.0
+
+# Графики аналитики (PNG-чарты в Telegram)
+matplotlib>=3.7.0
