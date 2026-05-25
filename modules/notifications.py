@@ -21,6 +21,7 @@ from core.funpay_client import funpay_client
 from utils.logger import logger
 
 _bot_ref: Optional[Bot] = None
+PHOTO_CAPTION_LIMIT = 900
 
 
 def set_bot(bot: Bot) -> None:
@@ -48,6 +49,12 @@ def _chat_link(chat_id: Any) -> str:
     if chat_id:
         return f"https://funpay.com/chat/?node={chat_id}"
     return "https://funpay.com/chat/"
+
+
+def _clip_html_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit - 1)].rstrip() + "…"
 
 
 # ─── Определение роли отправителя ────────────────────────────────────────────
@@ -241,11 +248,18 @@ async def notify_message(message) -> None:
 
         # Имена картинок ссылками (как Example.png на референсе)
         if images:
+            prefix = f"{role_emoji} <b>{safe_role_name}:</b> "
+            header = prefix + _clip_html_text(safe_body, PHOTO_CAPTION_LIMIT - len(prefix))
             links = []
             for i, img_url in enumerate(images[:5]):
                 fname = img_url.split("/")[-1].split("?")[0] or f"image_{i+1}.png"
                 links.append(f'<a href="{escape(img_url, quote=True)}">{escape(fname)}</a>')
-            header += "\n" + " ".join(links)
+            link_line = " ".join(links)
+            if len(link_line) + 1 < PHOTO_CAPTION_LIMIT:
+                header = _clip_html_text(header, PHOTO_CAPTION_LIMIT - len(link_line) - 1)
+                header += "\n" + link_line
+            else:
+                header = _clip_html_text(header, PHOTO_CAPTION_LIMIT)
 
         markup = kb_message_actions(chat_id, chat_name)
         first_photo = images[0] if images else None

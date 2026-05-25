@@ -437,9 +437,11 @@ class FunPayClient:
         text = self._normalize_message_text(text)
         if bool(getattr(chat, "last_by_bot", False)):
             return
-        if self._is_recent_incoming(chat_id, text):
+        node_msg_id = getattr(chat, "node_msg_id", None)
+        dedupe_key = f"node:{node_msg_id}" if node_msg_id else f"body:{text}"
+        if self._is_recent_incoming(chat_id, dedupe_key):
             return
-        self._register_incoming(chat_id, text)
+        self._register_incoming(chat_id, dedupe_key)
 
         # Создаём объект-обёртку с теми же атрибутами что и FunPayAPI.Message
         class _ChatMessage:
