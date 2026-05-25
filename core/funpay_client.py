@@ -404,7 +404,8 @@ class FunPayClient:
         except Exception:
             pass
         cid = getattr(msg, "chat_id", "?")
-        dedupe_key = text or getattr(msg, "image_link", "") or getattr(msg, "id", "")
+        msg_id = getattr(msg, "id", None)
+        dedupe_key = f"id:{msg_id}" if msg_id else f"body:{text or getattr(msg, 'image_link', '')}"
         if self._is_recent_incoming(cid, dedupe_key):
             logger.debug(f"📨 дубль сообщения пропущен (chat={cid})")
             return

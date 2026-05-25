@@ -25,22 +25,49 @@ def _line(label: str, value: str, color: str = CYAN) -> str:
     return f"  {_color(label.ljust(13), DIM)} {_color(value, color)}"
 
 
+def _supports_unicode() -> bool:
+    encoding = (getattr(sys.stdout, "encoding", None) or "").lower()
+    return "utf" in encoding
+
+
+def _safe_print(text: str = "") -> None:
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        safe = text.encode(getattr(sys.stdout, "encoding", None) or "ascii", errors="replace").decode(
+            getattr(sys.stdout, "encoding", None) or "ascii",
+            errors="replace",
+        )
+        print(safe)
+
+
 def print_startup_banner(*, funpay_available: bool) -> None:
-    title = [
-        "╭──────────────────────────────────────────────╮",
-        "│              PALTO FUNPAY BOT                │",
-        "│        Telegram control for FunPay shops      │",
-        "╰──────────────────────────────────────────────╯",
-    ]
+    if _supports_unicode():
+        title = [
+            "╭──────────────────────────────────────────────╮",
+            "│              PALTO FUNPAY BOT                │",
+            "│        Telegram control for FunPay shops      │",
+            "╰──────────────────────────────────────────────╯",
+        ]
+        separator = "  " + "─" * 46
+    else:
+        title = [
+            "+----------------------------------------------+",
+            "|              PALTO FUNPAY BOT                |",
+            "|        Telegram control for FunPay shops      |",
+            "+----------------------------------------------+",
+        ]
+        separator = "  " + "-" * 46
     gradient = [CYAN, BLUE, MAGENTA, MAGENTA]
-    print()
+    api_status = "loaded" if funpay_available else "not loaded"
+    _safe_print()
     for line, color in zip(title, gradient):
-        print(_color(line, color))
-    print(_color("     sell faster · answer cleaner · sleep longer", DIM))
-    print()
-    print(_line("Version", "1.0", GREEN))
-    print(_line("Python", platform.python_version(), GREEN))
-    print(_line("FunPay API", "local Cardinal fork" if funpay_available else "not loaded", GREEN if funpay_available else YELLOW))
-    print(_line("Started", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), CYAN))
-    print(_color("  " + "─" * 46, DIM))
-    print()
+        _safe_print(_color(line, color))
+    _safe_print(_color("     sell faster · answer cleaner · sleep longer", DIM))
+    _safe_print()
+    _safe_print(_line("Version", "1.0", GREEN))
+    _safe_print(_line("Python", platform.python_version(), GREEN))
+    _safe_print(_line("FunPay API", api_status, GREEN if funpay_available else YELLOW))
+    _safe_print(_line("Started", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), CYAN))
+    _safe_print(_color(separator, DIM))
+    _safe_print()
