@@ -1621,6 +1621,10 @@ class Account:
             elif last_msg_text.startswith(self.old_bot_character):
                 last_msg_text = last_msg_text[1:]
                 by_vertex = True
+
+            if last_msg_text.endswith(self.zero_width_suffix):
+                last_msg_text = last_msg_text[:-len(self.zero_width_suffix)]
+
             chat_obj = types.ChatShortcut(chat_id, chat_with, last_msg_text, node_msg_id, user_msg_id, unread, str(msg))
             if not is_image:
                 chat_obj.last_by_bot = by_bot
@@ -2140,6 +2144,8 @@ class Account:
                         message_text.startswith(self.__old_bot_character) and author_id == self.id:
                     message_text = message_text[1:]
                     by_bot = True
+                if message_text.endswith(self.zero_width_suffix):
+                    message_text = message_text[:-len(self.zero_width_suffix)]
                 # todo придумать, как отсеять юзеров со старыми версиями кардинала (подождать обнову фп?)
                 # elif message_text.startswith(self.__old_bot_character):
                 #     by_vertex = True
@@ -2315,6 +2321,10 @@ class Account:
     @property
     def old_bot_character(self) -> str:
         return self.__old_bot_character
+
+    @property
+    def zero_width_suffix(self) -> str:
+        return " ​‍‌"
 
     @property
     def locale(self) -> Literal["ru", "en", "uk"] | None:

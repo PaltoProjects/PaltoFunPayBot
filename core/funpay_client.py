@@ -81,6 +81,7 @@ class FunPayClient:
         # Используется для подавления echo-уведомлений когда FunPay
         # присылает наше же сообщение через NEW_MESSAGE.
         self._recent_outgoing: Dict[int, List[Tuple[str, float]]] = {}
+        self._recent_incoming: Dict[int, List[Tuple[str, float]]] = {}
 
     # ─── Подключение ──────────────────────────────────────────────────────────
 
@@ -220,8 +221,10 @@ class FunPayClient:
             return
 
         try:
-            self.runner = Runner(self.account)
-            logger.info("FunPay Runner инициализирован")
+            legacy_mode = bool(config_manager.settings.legacy_message_mode.enabled)
+            self.runner = Runner(self.account, disable_message_requests=legacy_mode)
+            mode_name = "legacy LastChatMessageChanged" if legacy_mode else "full NewMessageEvent"
+            logger.info(f"FunPay Runner инициализирован ({mode_name})")
         except Exception as e:
             logger.error(f"Ошибка инициализации Runner: {e}")
             self.runner = None
@@ -337,9 +340,11 @@ class FunPayClient:
                 await self._process_new_message(msg)
             return
 
-        # LAST_CHAT_MESSAGE_CHANGED — игнорируем, т.к. NEW_MESSAGE приходит отдельно
-        # (с теми же данными). Иначе сообщение будет дублироваться.
         if EventTypes and ev_type == EventTypes.LAST_CHAT_MESSAGE_CHANGED:
+            if self.runner and not getattr(self.runner, "make_msg_requests", True):
+                chat = getattr(ev, "chat", None)
+                if chat:
+                    await self._emit_message_from_chat(chat)
             return
 
         # CHATS_LIST_CHANGED — служебное, игнорируем
@@ -393,8 +398,17 @@ class FunPayClient:
             MessageTypes = None
 
         author = getattr(msg, "author", "?")
-        text = (getattr(msg, "text", "") or "")[:60]
+        text = self._normalize_message_text(getattr(msg, "text", "") or "")
+        try:
+            msg.text = text
+        except Exception:
+            pass
         cid = getattr(msg, "chat_id", "?")
+        dedupe_key = text or getattr(msg, "image_link", "") or getattr(msg, "id", "")
+        if self._is_recent_incoming(cid, dedupe_key):
+            logger.debug(f"📨 дубль сообщения пропущен (chat={cid})")
+            return
+        self._register_incoming(cid, dedupe_key)
         logger.info(f"📨 Новое сообщение в чате {cid} от {author}: {text}")
 
         # Если это отзыв (NEW_FEEDBACK) — эмитим NEW_REVIEW
@@ -419,6 +433,12 @@ class FunPayClient:
 
         if not chat_id:
             return
+        text = self._normalize_message_text(text)
+        if bool(getattr(chat, "last_by_bot", False)):
+            return
+        if self._is_recent_incoming(chat_id, text):
+            return
+        self._register_incoming(chat_id, text)
 
         # Создаём объект-обёртку с теми же атрибутами что и FunPayAPI.Message
         class _ChatMessage:
@@ -448,7 +468,7 @@ class FunPayClient:
         Используется в notify_message чтобы пропустить echo от FunPay.
         """
         import time as _t
-        text_norm = (text or "").strip()
+        text_norm = self._normalize_message_text(text)
         if not text_norm:
             return
         bucket = self._recent_outgoing.setdefault(chat_id, [])
@@ -456,6 +476,36 @@ class FunPayClient:
         # Чистим хвост старше 60 сек
         cutoff = _t.time() - 60
         self._recent_outgoing[chat_id] = [(t, ts) for t, ts in bucket if ts > cutoff]
+
+    @staticmethod
+    def _normalize_message_text(text: str) -> str:
+        suffix = " ​‍‌"
+        text = str(text or "").strip()
+        if text.endswith(suffix):
+            text = text[:-len(suffix)].strip()
+        return text
+
+    def _register_incoming(self, chat_id, text: str) -> None:
+        import time as _t
+        try:
+            cid = int(chat_id)
+        except (TypeError, ValueError):
+            return
+        text_norm = self._normalize_message_text(text)
+        bucket = self._recent_incoming.setdefault(cid, [])
+        bucket.append((text_norm, _t.time()))
+        cutoff = _t.time() - 20
+        self._recent_incoming[cid] = [(t, ts) for t, ts in bucket if ts > cutoff]
+
+    def _is_recent_incoming(self, chat_id, text: str) -> bool:
+        import time as _t
+        try:
+            cid = int(chat_id)
+        except (TypeError, ValueError):
+            return False
+        text_norm = self._normalize_message_text(text)
+        cutoff = _t.time() - 20
+        return any(ts > cutoff and t == text_norm for t, ts in self._recent_incoming.get(cid, []))
 
     def is_recent_outgoing(self, chat_id, text: str) -> bool:
         """
@@ -467,7 +517,7 @@ class FunPayClient:
             cid = int(chat_id)
         except (TypeError, ValueError):
             return False
-        text_norm = (text or "").strip()
+        text_norm = self._normalize_message_text(text)
         if not text_norm:
             return False
         bucket = self._recent_outgoing.get(cid, [])
@@ -586,7 +636,7 @@ class FunPayClient:
         except (TypeError, ValueError):
             return None
         try:
-            acc_chats = getattr(self.account, "_Account__chats", {}) or {}
+            acc_chats = getattr(self.account, "_Account__saved_chats", {}) or {}
             chat = acc_chats.get(cid)
             if chat:
                 return getattr(chat, "name", None)

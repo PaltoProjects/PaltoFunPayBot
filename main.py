@@ -59,18 +59,6 @@ def _main_safe() -> None:
         from utils.logger import logger, setup_logger
         setup_logger()
 
-        # Фирменный баннер
-        BANNER = r"""
-  ____       _ _        _____           ____             ____        _
- |  _ \ __ _| | |_ ___ |  ___|   _ _ __ |  _ \ __ _ _   _| __ )  ___ | |_
- | |_) / _` | | __/ _ \| |_ | | | | '_ \| |_) / _` | | | |  _ \ / _ \| __|
- |  __/ (_| | | || (_) |  _|| |_| | | | |  __/ (_| | |_| | |_) | (_) | |_
- |_|   \__,_|_|\__\___/|_|   \__,_|_| |_|_|   \__,_|\__, |____/ \___/ \__|
-                                                    |___/
-"""
-        print("\033[36m" + BANNER + "\033[0m")  # cyan
-        print("\033[35m" + "  Telegram-бот для FunPay" + "\033[0m\n")
-
         # ─── Обработка CLI-аргументов ────────────────────────────────────
         # python main.py --setup-proxy   — заново настроить прокси без перезапуска визарда целиком
         if "--setup-proxy" in sys.argv or "--proxy" in sys.argv:
@@ -168,6 +156,9 @@ def _main_safe() -> None:
         from config.settings import config_manager
         from core.event_bus import Event, event_bus
         from core.funpay_client import FUNPAY_AVAILABLE, FUNPAY_IMPORT_ERROR, funpay_client
+        from utils.console_banner import print_startup_banner
+
+        print_startup_banner(funpay_available=FUNPAY_AVAILABLE)
 
         # Предупреждение если FunPayAPI не загрузилась
         if not FUNPAY_AVAILABLE:

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import time
+from html import escape
 from typing import Any, Dict, List, Optional
 
 from aiogram import Bot
@@ -39,8 +40,8 @@ def _e(default: str) -> str:
 def _buyer_link(username: str, uid: Optional[int]) -> str:
     style = config_manager.settings.notification_style
     if style.show_buyer_link and uid:
-        return f'<a href="https://funpay.com/users/{uid}/">{username}</a>'
-    return username or "?"
+        return f'<a href="https://funpay.com/users/{uid}/">{escape(username or "?")}</a>'
+    return escape(username or "?")
 
 
 def _chat_link(chat_id: Any) -> str:
@@ -230,18 +231,20 @@ async def notify_message(message) -> None:
             return
 
         role_emoji, role_name = _detect_sender_role(message)
+        safe_role_name = escape(role_name or "?")
+        safe_body = escape(body or "(без текста)")
 
         if style.compact_mode:
-            header = f"{role_emoji} <b>{role_name}:</b> {body[:120]}"
+            header = f"{role_emoji} <b>{safe_role_name}:</b> {escape((body or '(без текста)')[:120])}"
         else:
-            header = f"{role_emoji} <b>{role_name}:</b> {body or '(без текста)'}"
+            header = f"{role_emoji} <b>{safe_role_name}:</b> {safe_body}"
 
         # Имена картинок ссылками (как Example.png на референсе)
         if images:
             links = []
             for i, img_url in enumerate(images[:5]):
                 fname = img_url.split("/")[-1].split("?")[0] or f"image_{i+1}.png"
-                links.append(f'<a href="{img_url}">{fname}</a>')
+                links.append(f'<a href="{escape(img_url, quote=True)}">{escape(fname)}</a>')
             header += "\n" + " ".join(links)
 
         markup = kb_message_actions(chat_id, chat_name)
