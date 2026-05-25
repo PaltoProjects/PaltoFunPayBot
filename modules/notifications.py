@@ -249,7 +249,8 @@ async def notify_message(message) -> None:
         # Имена картинок ссылками (как Example.png на референсе)
         if images:
             prefix = f"{role_emoji} <b>{safe_role_name}:</b> "
-            header = prefix + _clip_html_text(safe_body, PHOTO_CAPTION_LIMIT - len(prefix))
+            caption_body = escape((body or "(без текста)")[:120]) if style.compact_mode else safe_body
+            header = prefix + _clip_html_text(caption_body, PHOTO_CAPTION_LIMIT - len(prefix))
             links = []
             for i, img_url in enumerate(images[:5]):
                 fname = img_url.split("/")[-1].split("?")[0] or f"image_{i+1}.png"
