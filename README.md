@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2ca5e0?logo=telegram&logoColor=white)](https://aiogram.dev)
 [![License](https://img.shields.io/badge/license-Source%20Available-red)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0-orange)](https://github.com/PaltoProjects/PaltoFunPayBot)
+[![Version](https://img.shields.io/badge/version-1.1-orange)](https://github.com/PaltoProjects/PaltoFunPayBot)
 
 Управляй своим магазином на FunPay прямо из Telegram — автоподнятие, автовыдача, ИИ-ответы, аналитика и многое другое.
 
