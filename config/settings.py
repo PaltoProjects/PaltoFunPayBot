@@ -5,6 +5,8 @@
 Совместим с Python 3.8 — поэтому везде typing.Optional / typing.List / typing.Dict.
 """
 import json
+import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -203,6 +205,13 @@ class AISettings(BaseModel):
     shop_audit_enabled: bool = False
 
 
+class UpdateSettings(BaseModel):
+    """Обновление бота с GitHub (команда /update)."""
+    enabled: bool = True
+    repo: str = "PaltoProjects/PaltoFunPayBot"   # owner/repo на GitHub
+    branch: str = "main"                          # ветка для обновлений
+
+
 class PluginsSettings(BaseModel):
     """Система плагинов."""
     enabled: bool = True
@@ -327,6 +336,7 @@ class Settings(BaseModel):
     analytics: AnalyticsSettings = Field(default_factory=AnalyticsSettings)
     ai: AISettings = Field(default_factory=AISettings)
     plugins: PluginsSettings = Field(default_factory=PluginsSettings)
+    update: UpdateSettings = Field(default_factory=UpdateSettings)
 
     # Система и конфиги
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
@@ -378,24 +388,45 @@ class ConfigManager:
                 self._write(settings)
                 full = json.loads(self.path.read_text(encoding="utf-8"))
                 full["_migrations_applied"] = migrations
-                self.path.write_text(
-                    json.dumps(full, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                self._atomic_write(json.dumps(full, ensure_ascii=False, indent=2))
             return settings
         except Exception:
-            # Файл повреждён — делаем backup и создаём новый
-            backup = self.path.with_suffix(".broken.json")
-            self.path.rename(backup)
+            # Файл повреждён — делаем backup и создаём новый.
+            # os.replace перезаписывает существующий .broken.json (на Windows
+            # Path.rename падает с FileExistsError) — поэтому бот не зависнет
+            # на старте, если конфиг повредился повторно.
+            try:
+                backup = self.path.with_suffix(".broken.json")
+                os.replace(self.path, backup)
+            except Exception:
+                pass
             settings = Settings()
             self._write(settings)
             return settings
 
     def _write(self, settings: Settings) -> None:
-        self.path.write_text(
-            json.dumps(settings.model_dump(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._atomic_write(json.dumps(settings.model_dump(), ensure_ascii=False, indent=2))
+
+    def _atomic_write(self, text: str) -> None:
+        """
+        Атомарная запись: пишем во временный файл в той же папке и заменяем
+        целевой через os.replace. Прерывание (рестарт/выключение) посреди
+        записи больше не оставит битый config.json.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(self.path.parent), prefix=".config.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
 
     def save(self) -> None:
         with self._lock:

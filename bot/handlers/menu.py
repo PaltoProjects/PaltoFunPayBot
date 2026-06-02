@@ -1426,10 +1426,27 @@ async def edit_text(msg: types.Message, state: FSMContext) -> None:
 
     # Спецтаргеты для автовыдачи и системы
     if target == "__dlv_lot_id__":
-        if not text.strip().isdigit():
-            await msg.answer("❌ ID лота должен быть числом."); return
         lot_id = text.strip()
-        await msg.answer(f"📦 Лот <b>{lot_id}</b>: какой тип контента?", reply_markup=kb.kb_delivery_type_choice())
+        if not lot_id:
+            await msg.answer("❌ Пусто. Введите ID лота (число из URL) или его название."); return
+        hint = ""
+        # Если ввели число и есть подключение — сразу распознаём название лота,
+        # чтобы продавец видел, что сопоставление при оплате сработает.
+        if lot_id.isdigit():
+            from modules.auto_delivery import resolve_match_text
+            title = resolve_match_text(lot_id)
+            if title:
+                hint = f"\n🔎 Распознан лот: «<i>{title}</i>»"
+            else:
+                hint = (
+                    "\n⚠️ Не удалось получить название лота с FunPay "
+                    "(бот не подключён или лот не ваш). Если автовыдача не сработает — "
+                    "добавьте лот заново, указав <b>название</b> лота вместо ID."
+                )
+        await msg.answer(
+            f"📦 Лот <b>{lot_id}</b>: какой тип контента?{hint}",
+            reply_markup=kb.kb_delivery_type_choice(),
+        )
         await state.update_data(__dlv_set_lot_id__=lot_id)
         return
 

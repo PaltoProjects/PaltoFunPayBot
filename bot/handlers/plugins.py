@@ -275,7 +275,7 @@ BUILTIN_COMMANDS = {
     "start", "menu", "profile", "balance", "restart", "golden_key",
     "ban", "unban", "black_list", "upload_chat_img", "upload_offer_img",
     "test_lot", "logs", "about", "sys", "del_logs", "power_off",
-    "watermark", "check_updates", "plugins", "test_msg", "login",
+    "watermark", "check_updates", "update", "plugins", "test_msg", "login",
     "2fa_setup", "2fa_off", "audit", "export_settings", "gen_desc",
 }
 

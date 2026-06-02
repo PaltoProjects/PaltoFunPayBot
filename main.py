@@ -316,6 +316,7 @@ def _main_safe() -> None:
             BotCommand(command="power_off", description="выключить бота"),
             BotCommand(command="watermark", description="изменить водяной знак"),
             BotCommand(command="check_updates", description="проверить наличие обновлений"),
+            BotCommand(command="update", description="обновить бота с GitHub"),
             BotCommand(command="plugins", description="каталог плагинов"),
             BotCommand(command="test_msg", description="тестовое уведомление о сообщении"),
             BotCommand(command="login", description="ввести 2FA-код"),
@@ -366,6 +367,14 @@ def _main_safe() -> None:
                 logger.error(f"FunPay не подключился: {message}")
                 return
             asyncio.create_task(funpay_client.start_polling())
+
+            # Дозаполняем названия лотов для сопоставления автовыдачи
+            # (старые конфиги без match_text). В фоне, чтобы не тормозить старт.
+            try:
+                from modules.auto_delivery import backfill_match_texts
+                asyncio.create_task(loop.run_in_executor(None, backfill_match_texts))
+            except Exception as e:
+                logger.debug(f"backfill_match_texts не запущен: {e}")
 
             # Keep-alive чтобы прокси не закрывал idle-соединение
             try:

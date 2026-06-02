@@ -26,7 +26,10 @@ import asyncio
 import csv
 import io
 import json
+import os
 import random
+import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,9 +45,156 @@ DELIVERY_FILES_DIR.mkdir(parents=True, exist_ok=True)
 # Файл для отслеживания "уже предупредил о малом остатке"
 LOW_STOCK_NOTIFIED_PATH = Path(__file__).resolve().parent.parent / "data" / "low_stock_notified.json"
 
+# Заказы, по которым выдача уже произведена — защита от повторной выдачи,
+# если FunPay пришлёт событие об оплате дважды (new_order + status_changed)
+# или после перезапуска бота.
+DELIVERED_ORDERS_PATH = Path(__file__).resolve().parent.parent / "data" / "delivered_orders.json"
+_DELIVERED_CAP = 5000  # сколько последних id заказов помним
+
+# Блокировки на лот — чтобы два одновременных заказа не вычитали один и тот
+# же ключ из файла и не затёрли файл с ключами.
+_lot_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 
 def _file_path(lot_id: str, ext: str = "txt") -> Path:
     return DELIVERY_FILES_DIR / f"lot_{lot_id}.{ext}"
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Атомарная запись в файл (tmp + os.replace) — не теряем ключи при сбое."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Сопоставление заказа с лотом — по описанию (как FunPay Cardinal).
+#
+# FunPay в событии заказа НЕ отдаёт числовой offer_id. У объекта заказа есть
+# только order.description (название/краткое описание лота). Поэтому для каждого
+# настроенного лота мы храним match_text — текст, который ищем в описании заказа.
+# Если лот добавлен по числовому ID и аккаунт подключён, match_text берём из
+# названия лота (get_lot_fields(...).title_ru/title_en).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def resolve_match_text(lot_id: str) -> str:
+    """
+    Возвращает текст для сопоставления с order.description.
+
+    Для числового lot_id пытается получить название лота с FunPay.
+    Если не вышло (нет подключения / лот чужой) — возвращает сам lot_id
+    (для нечисловых ключей это и есть текст названия, введённый вручную).
+    """
+    key = str(lot_id).strip()
+    if not key.isdigit():
+        # Пользователь ввёл текст названия лота — используем как есть.
+        return key
+    acc = funpay_client.account
+    if not acc:
+        return ""
+    try:
+        fields = acc.get_lot_fields(int(key))
+        title = (getattr(fields, "title_ru", "") or getattr(fields, "title_en", "") or "").strip()
+        return title
+    except Exception as e:
+        logger.debug(f"resolve_match_text({key}): {e}")
+        return ""
+
+
+def _store_match_text(lot_id: str) -> None:
+    """Резолвит и сохраняет match_text в конфиг лота (best-effort)."""
+    info = config_manager.settings.auto_delivery.lots.get(lot_id)
+    if info is None:
+        return
+    mt = resolve_match_text(lot_id)
+    if mt:
+        info["match_text"] = mt
+
+
+def backfill_match_texts() -> int:
+    """
+    Дозаполняет match_text для лотов, у которых его нет (старые конфиги).
+    Вызывается на старте после подключения к FunPay. Возвращает кол-во заполненных.
+    """
+    n = 0
+    for lot_id, info in config_manager.settings.auto_delivery.lots.items():
+        if info.get("match_text"):
+            continue
+        mt = resolve_match_text(lot_id)
+        if mt:
+            info["match_text"] = mt
+            n += 1
+    if n:
+        config_manager.save()
+        logger.info(f"auto_delivery: распознано названий лотов для сопоставления: {n}")
+    return n
+
+
+def _find_lot_for_order(order) -> Tuple[Optional[str], Optional[dict]]:
+    """
+    Ищет настроенный лот для заказа по order.description (Cardinal-стиль).
+    Среди подходящих выбирает самый специфичный (с самым длинным match_text).
+    """
+    lots = config_manager.settings.auto_delivery.lots
+    if not lots:
+        return None, None
+
+    desc = (getattr(order, "description", "") or "").strip().lower()
+
+    best_id: Optional[str] = None
+    best_info: Optional[dict] = None
+    best_len = -1
+
+    for lot_id, info in lots.items():
+        match_text = (info.get("match_text") or str(lot_id)).strip().lower()
+        if not match_text:
+            continue
+        if desc and match_text in desc:
+            if len(match_text) > best_len:
+                best_id, best_info, best_len = lot_id, info, len(match_text)
+
+    return best_id, best_info
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Дедупликация выданных заказов
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_delivered() -> List[str]:
+    if not DELIVERED_ORDERS_PATH.exists():
+        return []
+    try:
+        return list(json.loads(DELIVERED_ORDERS_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return []
+
+
+def _is_delivered(order_id: str) -> bool:
+    return order_id in set(_load_delivered())
+
+
+def _mark_delivered(order_id: str) -> None:
+    ids = _load_delivered()
+    if order_id in ids:
+        return
+    ids.append(order_id)
+    if len(ids) > _DELIVERED_CAP:
+        ids = ids[-_DELIVERED_CAP:]
+    try:
+        _atomic_write_text(DELIVERED_ORDERS_PATH, json.dumps(ids))
+    except Exception as e:
+        logger.debug(f"_mark_delivered: {e}")
 
 
 def _load_notified() -> set:
@@ -73,6 +223,7 @@ def add_lot_static(lot_id: str, text: str, *, delay_sec: int = 0) -> None:
         "content": text,
         "delay_sec": delay_sec,
     }
+    _store_match_text(lot_id)
     config_manager.save()
 
 
@@ -81,13 +232,14 @@ def add_lot_file(lot_id: str, lines: List[str], *, delay_sec: int = 0,
     """Тип FILE — txt-файл, строки расходуются."""
     path = _file_path(lot_id, "txt")
     cleaned = [ln.strip() for ln in lines if ln.strip()]
-    path.write_text("\n".join(cleaned), encoding="utf-8")
+    _atomic_write_text(path, "\n".join(cleaned))
     config_manager.settings.auto_delivery.lots[lot_id] = {
         "type": "file",
         "content": str(path),
         "delay_sec": delay_sec,
         "low_stock_threshold": low_stock_threshold,
     }
+    _store_match_text(lot_id)
     # Сбрасываем флаг "уже предупредил" чтобы получить уведомление снова
     notified = _load_notified()
     notified.discard(str(lot_id))
@@ -107,7 +259,7 @@ def add_lot_csv(lot_id: str, csv_text: str, *, template: str = "",
     """
     path = _file_path(lot_id, "csv")
     # Сохраняем как есть
-    path.write_text(csv_text.strip(), encoding="utf-8")
+    _atomic_write_text(path, csv_text.strip())
     # Считаем строки (не пустые, без заголовка)
     lines = [l for l in csv_text.strip().splitlines() if l.strip()]
     count = max(0, len(lines) - 1) if lines else 0  # минус заголовок если есть
@@ -118,6 +270,7 @@ def add_lot_csv(lot_id: str, csv_text: str, *, template: str = "",
         "delay_sec": delay_sec,
         "low_stock_threshold": low_stock_threshold,
     }
+    _store_match_text(lot_id)
     notified = _load_notified()
     notified.discard(str(lot_id))
     _save_notified(notified)
@@ -133,6 +286,7 @@ def add_lot_random(lot_id: str, options: List[str], *, delay_sec: int = 0) -> No
         "options": cleaned,
         "delay_sec": delay_sec,
     }
+    _store_match_text(lot_id)
     config_manager.save()
 
 
@@ -141,7 +295,7 @@ def add_lot_combined(lot_id: str, instruction: str, keys: List[str], *,
     """Тип COMBINED — общая инструкция + уникальный ключ из файла."""
     path = _file_path(lot_id, "txt")
     cleaned = [k.strip() for k in keys if k.strip()]
-    path.write_text("\n".join(cleaned), encoding="utf-8")
+    _atomic_write_text(path, "\n".join(cleaned))
     config_manager.settings.auto_delivery.lots[lot_id] = {
         "type": "combined",
         "instruction": instruction,
@@ -149,6 +303,7 @@ def add_lot_combined(lot_id: str, instruction: str, keys: List[str], *,
         "delay_sec": delay_sec,
         "low_stock_threshold": low_stock_threshold,
     }
+    _store_match_text(lot_id)
     notified = _load_notified()
     notified.discard(str(lot_id))
     _save_notified(notified)
@@ -199,7 +354,7 @@ def _pop_keys_from_file(path: Path, count: int) -> List[str]:
     lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     taken = lines[:count]
     rest = lines[count:]
-    path.write_text("\n".join(rest), encoding="utf-8")
+    _atomic_write_text(path, "\n".join(rest))
     return taken
 
 
@@ -227,7 +382,7 @@ def _pop_csv_rows(path: Path, count: int) -> Tuple[List[str], List[List[str]]]:
     w.writerow(header)
     for row in rest:
         w.writerow(row)
-    path.write_text(out.getvalue(), encoding="utf-8")
+    _atomic_write_text(path, out.getvalue())
     return header, taken
 
 
@@ -260,61 +415,80 @@ async def handle_order_paid(order) -> None:
     if not cfg.enabled:
         return
 
-    # ID лота
-    lot_id = (
-        str(getattr(order, "subcategory_id", "") or "")
-        or str(getattr(order, "lot_id", "") or "")
-        or str(getattr(order, "offer_id", "") or "")
-        or str(getattr(order, "id", "") or "")
-    )
+    # Защита от повторной выдачи (FunPay может прислать оплату дважды).
+    order_id = str(getattr(order, "id", "") or "")
+    if order_id and _is_delivered(order_id):
+        logger.debug(f"auto_delivery: заказ #{order_id} уже выдан — пропуск (дубль)")
+        return
 
     # ID чата
     chat_id = getattr(order, "chat_id", None) or getattr(order, "buyer_chat_id", None)
     amount = max(1, int(getattr(order, "amount", 1) or 1))
 
-    if not lot_id or not chat_id:
-        logger.warning(f"auto_delivery: не нашёл lot_id или chat_id (заказ {order})")
+    if not chat_id:
+        logger.warning(f"auto_delivery: не нашёл chat_id (заказ {order})")
         return
 
-    info = cfg.lots.get(lot_id)
+    # Ищем лот по описанию заказа (Cardinal-стиль).
+    lot_id, info = _find_lot_for_order(order)
     if not info:
-        logger.info(f"auto_delivery: лот {lot_id} не настроен — пропуск")
+        logger.info(
+            f"auto_delivery: для заказа #{order_id} "
+            f"(«{(getattr(order, 'description', '') or '')[:50]}») нет настроенного лота — пропуск"
+        )
         return
 
-    # Определяем сколько штук выдавать (мульти-выдача)
-    multi_enabled = config_manager.settings.multi_delivery.enabled
-    count = amount if multi_enabled else 1
+    # Всё, что меняет файл ключей, делаем под блокировкой лота, чтобы
+    # параллельные заказы не вычитали один ключ дважды и не затёрли файл.
+    async with _lot_locks[lot_id]:
+        # Повторная проверка дедупа уже под локом (на случай гонки).
+        if order_id and _is_delivered(order_id):
+            return
 
-    # Отложенная выдача
-    delay_sec = int(info.get("delay_sec", 0))
-    if delay_sec > 0:
-        logger.info(f"auto_delivery: отложенная выдача лота {lot_id} на {delay_sec}с")
-        await asyncio.sleep(delay_sec)
+        # Определяем сколько штук выдавать (мульти-выдача)
+        multi_enabled = config_manager.settings.multi_delivery.enabled
+        count = amount if multi_enabled else 1
 
-    # Формируем текст по типу
-    text, success = await _build_delivery_text(lot_id, info, count)
+        # Отложенная выдача
+        delay_sec = int(info.get("delay_sec", 0))
+        if delay_sec > 0:
+            logger.info(f"auto_delivery: отложенная выдача лота {lot_id} на {delay_sec}с")
+            await asyncio.sleep(delay_sec)
 
-    if not success:
-        # Ключи закончились — шлём out_of_stock + автодеактивация
-        funpay_client.send_message(chat_id, cfg.out_of_stock_message)
-        logger.warning(f"auto_delivery: лот {lot_id} — ключи закончились")
-        await event_bus.emit("delivery_out_of_stock", order)
-        if config_manager.settings.auto_activation.enabled:
-            try:
-                from modules.auto_deactivation import deactivate_lot
-                await deactivate_lot(lot_id)
-            except Exception as e:
-                logger.warning(f"auto-deactivate {lot_id}: {e}")
-        return
+        # Формируем текст по типу (расходные типы вычитают ключи из файла)
+        text, success = await _build_delivery_text(lot_id, info, count)
 
-    # Отправляем
-    funpay_client.send_message(chat_id, text)
-    logger.info(f"auto_delivery → лот {lot_id} ({info['type']}, {count} шт.)")
-    audit(0, "AUTO_DELIVERY", data=f"lot={lot_id} type={info['type']} count={count}")
-    await event_bus.emit("delivery_sent", order, text)
+        if not success:
+            # Ключи закончились — шлём out_of_stock + автодеактивация
+            funpay_client.send_message(chat_id, cfg.out_of_stock_message)
+            logger.warning(f"auto_delivery: лот {lot_id} — ключи закончились")
+            await event_bus.emit("delivery_out_of_stock", order)
+            if config_manager.settings.auto_activation.enabled:
+                try:
+                    from modules.auto_deactivation import deactivate_lot
+                    await deactivate_lot(lot_id)
+                except Exception as e:
+                    logger.warning(f"auto-deactivate {lot_id}: {e}")
+            return
 
-    # Проверка низкого остатка
-    await _check_low_stock(lot_id, info)
+        # Помечаем заказ выданным СРАЗУ после успешного формирования текста:
+        # для расходных типов ключи уже вычтены из файла, поэтому повторное
+        # событие об оплате не должно вычитать ещё один ключ.
+        if order_id:
+            _mark_delivered(order_id)
+
+        sent = funpay_client.send_message(chat_id, text)
+        if not sent:
+            logger.warning(
+                f"auto_delivery: лот {lot_id} — товар сформирован, но отправка не подтвердилась. "
+                f"Проверьте заказ #{order_id} вручную."
+            )
+        logger.info(f"auto_delivery → лот {lot_id} ({info['type']}, {count} шт.)")
+        audit(0, "AUTO_DELIVERY", data=f"lot={lot_id} type={info['type']} count={count} order={order_id}")
+        await event_bus.emit("delivery_sent", order, text)
+
+        # Проверка низкого остатка
+        await _check_low_stock(lot_id, info)
 
 
 async def _build_delivery_text(

@@ -369,14 +369,79 @@ async def cmd_watermark(msg: types.Message, state: FSMContext) -> None:
 
 # ─── /check_updates ──────────────────────────────────────────────────────────
 
+def _fmt_file_list(paths: list[str], limit: int = 30) -> str:
+    if not paths:
+        return ""
+    shown = paths[:limit]
+    lines = "\n".join(f"• <code>{p}</code>" for p in shown)
+    if len(paths) > limit:
+        lines += f"\n… и ещё {len(paths) - limit}"
+    return lines
+
+
 @router.message(Command("check_updates"))
 async def cmd_check_updates(msg: types.Message) -> None:
     if not _ensure(msg):
         return
-    await msg.answer(
+    from utils import updater
+
+    wait = await msg.answer(
         f"🔄 Текущая версия: <b>{config_manager.settings.version}</b>\n\n"
-        f"Проверка обновлений с GitHub будет в следующих релизах."
+        f"Проверяю обновления на GitHub…"
     )
+    changed, err = await asyncio.get_event_loop().run_in_executor(None, updater.check_only)
+    if err:
+        await wait.edit_text(f"❌ Не удалось проверить обновления:\n<code>{err}</code>")
+        return
+    if not changed:
+        await wait.edit_text("✅ У вас актуальная версия — обновлять нечего.")
+        return
+    await wait.edit_text(
+        f"📦 Доступно обновление: <b>{len(changed)}</b> файл(ов).\n\n"
+        f"{_fmt_file_list(changed)}\n\n"
+        f"Чтобы установить — выполните /update"
+    )
+
+
+# ─── /update ───────────────────────────────────────────────────────────────────
+
+@router.message(Command("update"))
+async def cmd_update(msg: types.Message) -> None:
+    if not is_admin(msg.from_user.id):
+        await msg.answer("⛔ Только для админов.")
+        return
+
+    from utils import updater
+
+    if not config_manager.settings.update.enabled:
+        await msg.answer("⚠️ Обновления отключены в настройках.")
+        return
+
+    wait = await msg.answer("⬇️ Скачиваю и применяю обновление… Это может занять минуту.")
+    result = await asyncio.get_event_loop().run_in_executor(None, updater.perform_update)
+
+    if result.get("error"):
+        await wait.edit_text(f"❌ Обновление не выполнено:\n<code>{result['error']}</code>")
+        return
+
+    updated = result.get("updated", [])
+    failed = result.get("failed", [])
+    deleted = result.get("deleted", [])
+
+    if not updated and not deleted:
+        await wait.edit_text("✅ Обновлять было нечего — у вас актуальная версия.")
+        return
+
+    parts = [
+        f"✅ Обновление установлено.",
+        f"Обновлено: <b>{len(updated)}</b>, удалено: <b>{len(deleted)}</b>, ошибок: <b>{len(failed)}</b>.",
+    ]
+    if updated:
+        parts.append("\n<b>Обновлённые файлы:</b>\n" + _fmt_file_list(updated))
+    if failed:
+        parts.append("\n<b>⚠️ Не удалось скачать:</b>\n" + _fmt_file_list(failed))
+    parts.append("\n♻️ Чтобы изменения вступили в силу — выполните /restart")
+    await wait.edit_text("\n".join(parts))
 
 
 # ─── /plugins ────────────────────────────────────────────────────────────────

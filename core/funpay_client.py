@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -81,6 +82,10 @@ class FunPayClient:
         # Используется для подавления echo-уведомлений когда FunPay
         # присылает наше же сообщение через NEW_MESSAGE.
         self._recent_outgoing: Dict[int, List[Tuple[str, float]]] = {}
+        # ID заказов, по которым уже эмитили ORDER_PAID — FunPay присылает
+        # оплату дважды (NEW_ORDER со статусом PAID + ORDER_STATUS_CHANGED).
+        # Без дедупа аналитика, уведомления и автовыдача срабатывали бы дважды.
+        self._emitted_paid: "OrderedDict[str, bool]" = OrderedDict()
 
     # ─── Подключение ──────────────────────────────────────────────────────────
 
@@ -315,6 +320,19 @@ class FunPayClient:
         except Exception as e:
             logger.exception(f"❌ _dispatch упал: {type(e).__name__}: {e}")
 
+    def _should_emit_paid(self, order) -> bool:
+        """True только для ПЕРВОГО события об оплате конкретного заказа."""
+        oid = str(getattr(order, "id", "") or "")
+        if not oid:
+            return True  # без id дедупить нечем — пропускаем как есть
+        if oid in self._emitted_paid:
+            return False
+        self._emitted_paid[oid] = True
+        # Ограничиваем память — храним последние 2000 заказов
+        while len(self._emitted_paid) > 2000:
+            self._emitted_paid.popitem(last=False)
+        return True
+
     async def _dispatch_inner(self, ev: Any) -> None:
         """
         Используем event.type (enum EventTypes) как Cardinal — это надёжнее
@@ -361,7 +379,7 @@ class FunPayClient:
                 await event_bus.emit(Event.NEW_ORDER, order)
                 if OrderStatuses:
                     status = getattr(order, "status", None)
-                    if status == OrderStatuses.PAID:
+                    if status == OrderStatuses.PAID and self._should_emit_paid(order):
                         await event_bus.emit(Event.ORDER_PAID, order)
             return
 
@@ -378,7 +396,7 @@ class FunPayClient:
                 elif status == OrderStatuses.REFUNDED:
                     logger.info(f"↩️ Заказ #{getattr(order, 'id', '?')} возвращён")
                     await event_bus.emit(Event.ORDER_REFUNDED, order)
-                elif status == OrderStatuses.PAID:
+                elif status == OrderStatuses.PAID and self._should_emit_paid(order):
                     await event_bus.emit(Event.ORDER_PAID, order)
             return
 
