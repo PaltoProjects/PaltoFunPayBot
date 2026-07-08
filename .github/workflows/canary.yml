@@ -35,19 +35,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create funpay-canary --color d93f0b \
             --description "Канарейка парсера FunPay упала" --force || true
+          {
+            echo "Ежедневная проверка парсера против живого funpay.com упала — вероятно, FunPay изменил вёрстку."
+            echo ""
+            echo "Лог запуска: $RUN_URL"
+            echo ""
+            echo "Что проверить: якоря в \`FunPayAPI/account.py\` (data-app-data, user-link-name, promo-game-item, tc-item/tc-price) и синхронизацию с апстримом FunPayCardinal."
+          } > /tmp/issue_body.md
           existing=$(gh issue list --label funpay-canary --state open --json number --jq '.[0].number')
           if [ -z "$existing" ]; then
             gh issue create \
               --title "🐤 Канарейка: парсер FunPayAPI сломался ($(date -u +%Y-%m-%d))" \
               --label funpay-canary \
-              --body "Ежедневная проверка парсера против живого funpay.com упала — вероятно, FunPay изменил вёрстку.
-
-Лог запуска: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-Что проверить: якоря в \`FunPayAPI/account.py\` (data-app-data, user-link-name, promo-game-item, tc-item/tc-price) и синхронизацию с апстримом FunPayCardinal."
+              --body-file /tmp/issue_body.md
           else
-            gh issue comment "$existing" --body "Канарейка снова упала: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh issue comment "$existing" --body "Канарейка снова упала: $RUN_URL"
           fi
