@@ -8,6 +8,15 @@ import sys
 import platform
 from pathlib import Path
 
+# Windows: при перенаправленном выводе (pipe, > файл) stdout использует
+# cp1251/cp866 и падает на эмодзи. Принудительно UTF-8 с заменой символов.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 def main():
     print("=" * 70)
