@@ -31,7 +31,7 @@ import random
 import tempfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
@@ -358,6 +358,35 @@ def _pop_keys_from_file(path: Path, count: int) -> List[str]:
     return taken
 
 
+def _push_keys_back(path: Path, keys: List[str]) -> None:
+    """Возвращает ключи В НАЧАЛО txt-файла (при неудачной отправке)."""
+    if not keys:
+        return
+    existing = []
+    if path.exists():
+        existing = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    _atomic_write_text(path, "\n".join(keys + existing))
+
+
+def _push_csv_rows_back(path: Path, header: List[str], rows: List[List[str]]) -> None:
+    """Возвращает строки в CSV сразу после заголовка (при неудачной отправке)."""
+    if not rows:
+        return
+    existing_rows: List[List[str]] = []
+    if path.exists():
+        reader = csv.reader(io.StringIO(path.read_text(encoding="utf-8")))
+        all_rows = [r for r in reader if any(c.strip() for c in r)]
+        if all_rows:
+            header = all_rows[0]
+            existing_rows = all_rows[1:]
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(header)
+    for row in rows + existing_rows:
+        w.writerow(row)
+    _atomic_write_text(path, out.getvalue())
+
+
 def _pop_csv_rows(path: Path, count: int) -> Tuple[List[str], List[List[str]]]:
     """
     Достаёт N строк из CSV. Возвращает (header, rows).
@@ -456,11 +485,15 @@ async def handle_order_paid(order) -> None:
             await asyncio.sleep(delay_sec)
 
         # Формируем текст по типу (расходные типы вычитают ключи из файла)
-        text, success = await _build_delivery_text(lot_id, info, count)
+        text, success, restore = await _build_delivery_text(lot_id, info, count)
+
+        loop = asyncio.get_event_loop()
 
         if not success:
             # Ключи закончились — шлём out_of_stock + автодеактивация
-            funpay_client.send_message(chat_id, cfg.out_of_stock_message)
+            await loop.run_in_executor(
+                None, funpay_client.send_message, chat_id, cfg.out_of_stock_message
+            )
             logger.warning(f"auto_delivery: лот {lot_id} — ключи закончились")
             await event_bus.emit("delivery_out_of_stock", order)
             if config_manager.settings.auto_activation.enabled:
@@ -471,18 +504,44 @@ async def handle_order_paid(order) -> None:
                     logger.warning(f"auto-deactivate {lot_id}: {e}")
             return
 
-        # Помечаем заказ выданным СРАЗУ после успешного формирования текста:
-        # для расходных типов ключи уже вычтены из файла, поэтому повторное
-        # событие об оплате не должно вычитать ещё один ключ.
+        # Отправляем ДО пометки «выдано». send_message сам режет длинный текст
+        # по 20 строк и делает ретраи; в executor — чтобы ретраи не блокировали
+        # event loop (мы всё ещё под локом лота, гонок нет).
+        sent = await loop.run_in_executor(None, funpay_client.send_message, chat_id, text)
+
+        if not sent:
+            # Отправка не подтвердилась: возвращаем вычтенные ключи в файл
+            # и НЕ помечаем заказ выданным — повторное событие об оплате
+            # (или рестарт) попробует выдать снова.
+            if restore is not None:
+                try:
+                    restore()
+                    logger.warning(
+                        f"auto_delivery: лот {lot_id} — отправка не удалась, "
+                        f"ключи возвращены в файл"
+                    )
+                except Exception as e:
+                    logger.error(f"auto_delivery: не смог вернуть ключи лота {lot_id}: {e}")
+            logger.warning(
+                f"auto_delivery: лот {lot_id} — не удалось отправить товар. "
+                f"Проверьте заказ #{order_id} вручную."
+            )
+            try:
+                from modules.notifications import _send_to_all
+                await _send_to_all(
+                    f"❌ <b>Автовыдача не удалась</b>\n\n"
+                    f"Заказ <code>#{order_id}</code>, лот <code>{lot_id}</code>: "
+                    f"сообщение с товаром не доставлено.\n"
+                    f"Ключи возвращены в файл. Выдайте вручную или дождитесь повторного события."
+                )
+            except Exception as e:
+                logger.debug(f"delivery fail notify: {e}")
+            return
+
+        # Только теперь помечаем заказ выданным.
         if order_id:
             _mark_delivered(order_id)
 
-        sent = funpay_client.send_message(chat_id, text)
-        if not sent:
-            logger.warning(
-                f"auto_delivery: лот {lot_id} — товар сформирован, но отправка не подтвердилась. "
-                f"Проверьте заказ #{order_id} вручную."
-            )
         logger.info(f"auto_delivery → лот {lot_id} ({info['type']}, {count} шт.)")
         audit(0, "AUTO_DELIVERY", data=f"lot={lot_id} type={info['type']} count={count} order={order_id}")
         await event_bus.emit("delivery_sent", order, text)
@@ -493,42 +552,51 @@ async def handle_order_paid(order) -> None:
 
 async def _build_delivery_text(
     lot_id: str, info: dict, count: int
-) -> Tuple[str, bool]:
-    """Формирует текст выдачи. Возвращает (text, success)."""
+) -> Tuple[str, bool, Optional[Callable[[], None]]]:
+    """
+    Формирует текст выдачи. Возвращает (text, success, restore).
+
+    restore — замыкание, возвращающее вычтенные ключи обратно в файл;
+    None для нерасходных типов (static, random). Вызывать, если отправка
+    покупателю не подтвердилась.
+    """
     t = info.get("type")
 
     if t == "static":
-        return info.get("content", ""), True
+        return info.get("content", ""), True, None
 
     if t == "random":
         options = info.get("options", [])
         if not options:
-            return "", False
-        return random.choice(options), True
+            return "", False, None
+        return random.choice(options), True, None
 
     if t == "file":
-        keys = _pop_keys_from_file(Path(info["content"]), count)
+        path = Path(info["content"])
+        keys = _pop_keys_from_file(path, count)
         if not keys:
-            return "", False
-        return "\n".join(keys), True
+            return "", False, None
+        return "\n".join(keys), True, (lambda: _push_keys_back(path, keys))
 
     if t == "combined":
-        keys = _pop_keys_from_file(Path(info["content"]), count)
+        path = Path(info["content"])
+        keys = _pop_keys_from_file(path, count)
         if not keys:
-            return "", False
+            return "", False, None
         instruction = info.get("instruction", "")
         body = "\n".join(keys)
-        return f"{instruction}\n\n{body}".strip(), True
+        return f"{instruction}\n\n{body}".strip(), True, (lambda: _push_keys_back(path, keys))
 
     if t == "csv":
-        header, rows = _pop_csv_rows(Path(info["content"]), count)
+        path = Path(info["content"])
+        header, rows = _pop_csv_rows(path, count)
         if not rows:
-            return "", False
+            return "", False, None
         template = info.get("template", "")
         formatted = [_format_csv_row(header, row, template) for row in rows]
-        return "\n\n".join(formatted), True
+        return "\n\n".join(formatted), True, (lambda: _push_csv_rows_back(path, header, rows))
 
-    return "", False
+    return "", False, None
 
 
 async def _check_low_stock(lot_id: str, info: dict) -> None:

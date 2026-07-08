@@ -86,6 +86,13 @@ class FunPayClient:
         # оплату дважды (NEW_ORDER со статусом PAID + ORDER_STATUS_CHANGED).
         # Без дедупа аналитика, уведомления и автовыдача срабатывали бы дважды.
         self._emitted_paid: "OrderedDict[str, bool]" = OrderedDict()
+        # Fallback на old mode: если NEW_MESSAGE перестал приходить, а
+        # активность в чатах есть (LAST_CHAT_MESSAGE_CHANGED) — читаем
+        # сообщения из ChatShortcut, чтобы бот не ослеп.
+        self._last_new_message_ts: float = 0.0
+        self._activity_without_new_message: int = 0
+        self._old_mode_fallback: bool = False
+        self._fallback_last_emitted: Dict[int, str] = {}  # chat_id → последний эмитнутый текст
 
     # ─── Подключение ──────────────────────────────────────────────────────────
 
@@ -220,6 +227,11 @@ class FunPayClient:
 
         self._running = True
 
+        # Точка отсчёта для old-mode fallback — стартовые INITIAL-события
+        # не должны триггерить переключение.
+        import time as _t
+        self._last_new_message_ts = _t.time()
+
         if Runner is None:
             logger.warning("Runner недоступен")
             return
@@ -352,12 +364,16 @@ class FunPayClient:
         if EventTypes and ev_type == EventTypes.NEW_MESSAGE:
             msg = getattr(ev, "message", None)
             if msg:
+                self._note_new_message_alive(msg)
                 await self._process_new_message(msg)
             return
 
-        # LAST_CHAT_MESSAGE_CHANGED — игнорируем, т.к. NEW_MESSAGE приходит отдельно
-        # (с теми же данными). Иначе сообщение будет дублироваться.
+        # LAST_CHAT_MESSAGE_CHANGED — в норме игнорируем (NEW_MESSAGE приходит
+        # отдельно с теми же данными, иначе были бы дубли). Но если NEW_MESSAGE
+        # перестал приходить при живой активности в чатах — включаем fallback
+        # и читаем сообщения отсюда (аналог old mode Cardinal'а).
         if EventTypes and ev_type == EventTypes.LAST_CHAT_MESSAGE_CHANGED:
+            await self._handle_last_chat_message_changed(ev)
             return
 
         # CHATS_LIST_CHANGED — служебное, игнорируем
@@ -402,6 +418,73 @@ class FunPayClient:
 
         # Прочие в DEBUG
         logger.debug(f"FunPay event ignored: {type_name}")
+
+    # ─── Old-mode fallback ────────────────────────────────────────────────────
+    #
+    # Симптом: на некоторых аккаунтах FunPay перестаёт отдавать NEW_MESSAGE,
+    # но LAST_CHAT_MESSAGE_CHANGED продолжает приходить. Без fallback бот
+    # молча слепнет: нет автоответа, приветствий, уведомлений.
+
+    # Включаем fallback, если NEW_MESSAGE нет дольше этого времени…
+    FALLBACK_AFTER_SEC = 300
+    # …и за это время накопилось столько входящих LAST_CHAT_MESSAGE_CHANGED.
+    FALLBACK_AFTER_EVENTS = 3
+
+    def _note_new_message_alive(self, msg) -> None:
+        """Вызывается на каждом NEW_MESSAGE: сбрасывает счётчики fallback."""
+        import time as _t
+        self._last_new_message_ts = _t.time()
+        self._activity_without_new_message = 0
+        if self._old_mode_fallback:
+            self._old_mode_fallback = False
+            logger.info("NEW_MESSAGE снова приходит — выключаю old-mode fallback")
+        # Защита от дубля на границе переключения: помечаем текст как уже
+        # обработанный, чтобы fallback не эмитнул его повторно.
+        cid = getattr(msg, "chat_id", None)
+        text = (getattr(msg, "text", "") or "").strip()
+        if cid and text:
+            self._fallback_last_emitted[cid] = text
+
+    async def _handle_last_chat_message_changed(self, ev) -> None:
+        """
+        Решает, надо ли эмитить сообщение из LAST_CHAT_MESSAGE_CHANGED.
+        В норме — нет (дубль NEW_MESSAGE). При молчании NEW_MESSAGE — да.
+        """
+        chat = getattr(ev, "chat", None)
+        if chat is None:
+            return
+        chat_id = getattr(chat, "id", None)
+        text = (getattr(chat, "last_message_text", "") or "").strip()
+        if not chat_id or not text:
+            return
+
+        # Интересуют только входящие непрочитанные сообщения не от нас
+        if getattr(chat, "last_by_bot", False) or not getattr(chat, "unread", False):
+            return
+        if self.is_recent_outgoing(chat_id, text):
+            return
+
+        import time as _t
+        now = _t.time()
+
+        if not self._old_mode_fallback:
+            if now - self._last_new_message_ts < self.FALLBACK_AFTER_SEC:
+                return
+            self._activity_without_new_message += 1
+            if self._activity_without_new_message < self.FALLBACK_AFTER_EVENTS:
+                return
+            self._old_mode_fallback = True
+            logger.warning(
+                f"⚠️ NEW_MESSAGE не приходит уже {int(now - self._last_new_message_ts)}с "
+                f"при живой активности в чатах — включаю old-mode fallback: "
+                f"сообщения будут читаться из LAST_CHAT_MESSAGE_CHANGED"
+            )
+
+        # Дедуп: одно и то же последнее сообщение чата не эмитим дважды
+        if self._fallback_last_emitted.get(chat_id) == text:
+            return
+        self._fallback_last_emitted[chat_id] = text
+        await self._emit_message_from_chat(chat)
 
     async def _process_new_message(self, msg) -> None:
         """Эмитит NEW_MESSAGE/NEW_REVIEW в шину событий."""
@@ -522,13 +605,28 @@ class FunPayClient:
         except Exception:
             return 0
 
-    def send_message(self, chat_id, text: str) -> bool:
+    # FunPay не принимает сообщения длиннее 20 строк — режем как Cardinal.
+    _MAX_LINES_PER_MESSAGE = 20
+
+    @classmethod
+    def _split_message(cls, text: str) -> List[str]:
+        """Разбивает текст на куски по 20 строк (лимит FunPay)."""
+        lines = str(text).split("\n")
+        chunks = []
+        while lines:
+            chunk = "\n".join(lines[:cls._MAX_LINES_PER_MESSAGE]).rstrip()
+            del lines[:cls._MAX_LINES_PER_MESSAGE]
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+
+    def send_message(self, chat_id, text: str, attempts: int = 3) -> bool:
         """
         Отправляет сообщение в FunPay-чат.
 
-        Возвращает True если отправка прошла. AttributeError на парсинге
-        ответа FunPay считается успехом — сообщение в этом случае ушло,
-        а упал только парсер ответа в самом FunPayAPI.
+        Длинный текст режется на куски по 20 строк (лимит FunPay), каждый
+        кусок отправляется с ретраями (attempts попыток). True — только если
+        доставлены ВСЕ куски.
         """
         if not self.account:
             return False
@@ -558,42 +656,58 @@ class FunPayClient:
         except Exception:
             pass
 
-        try:
-            # update_last_saved_message=False — иначе FunPayAPI попытается
-            # обновить кэш и упадёт с "'NoneType' object has no attribute 'text'"
-            self.account.send_message(cid, text, update_last_saved_message=False)
-            self._register_outgoing(cid, text)
-            return True
+        for chunk in self._split_message(text):
+            if not self._send_chunk(cid, chunk, attempts):
+                return False
+        return True
 
-        except AttributeError as e:
-            # 'NoneType' object has no attribute 'text' — сообщение УШЛО,
-            # но FunPayAPI не смог распарсить ответ. Считаем успешной отправкой.
-            if "'text'" in str(e):
+    def _send_chunk(self, cid: int, text: str, attempts: int = 3) -> bool:
+        """
+        Отправляет один кусок (<= 20 строк) с ретраями.
+
+        AttributeError на парсинге ответа FunPay считается успехом —
+        сообщение в этом случае ушло, а упал только парсер ответа
+        в самом FunPayAPI (ретраить нельзя — будет дубль).
+        """
+        import time as _t
+        last_err = ""
+        for attempt in range(attempts):
+            if attempt:
+                _t.sleep(1)
+            try:
+                # update_last_saved_message=False — иначе FunPayAPI попытается
+                # обновить кэш и упадёт с "'NoneType' object has no attribute 'text'"
+                self.account.send_message(cid, text, update_last_saved_message=False)
                 self._register_outgoing(cid, text)
-                logger.debug(f"send_message({cid}): отправлено (FunPayAPI парсер упал на ответе)")
                 return True
-            logger.debug(f"send_message({cid}): {e}")
-            return False
 
-        except Exception as e:
-            err_str = str(e)
-            err_type = type(e).__name__
+            except AttributeError as e:
+                if "'text'" in str(e):
+                    self._register_outgoing(cid, text)
+                    logger.debug(f"send_message({cid}): отправлено (FunPayAPI парсер упал на ответе)")
+                    return True
+                last_err = f"AttributeError: {e}"
+                logger.debug(f"send_message({cid}): {e} (попытка {attempt + 1}/{attempts})")
 
-            # Тихие коды — обычное состояние, не пишем WARNING
-            if any(k in err_str for k in (
-                "не удалось получить истории чатов",
-                "Не удалось получить истории чатов",
-                "MessageNotDelivered",
-            )):
-                logger.debug(f"send_message({cid}): {err_str[:120]}")
-                return False
+            except Exception as e:
+                err_str = str(e)
+                err_type = type(e).__name__
 
-            if "RequestFailed" in err_type:
-                logger.debug(f"send_message({cid}): HTTP ошибка")
-                return False
+                # Тихие коды — обычное состояние, не пишем WARNING
+                if any(k in err_str for k in (
+                    "не удалось получить истории чатов",
+                    "Не удалось получить истории чатов",
+                    "MessageNotDelivered",
+                )):
+                    last_err = err_str[:120]
+                elif "RequestFailed" in err_type:
+                    last_err = f"HTTP ошибка ({err_type})"
+                else:
+                    last_err = f"{err_type}: {err_str[:200]}"
+                logger.debug(f"send_message({cid}): {last_err} (попытка {attempt + 1}/{attempts})")
 
-            logger.debug(f"send_message({cid}): {err_type}: {err_str[:200]}")
-            return False
+        logger.warning(f"send_message({cid}): не доставлено после {attempts} попыток: {last_err}")
+        return False
 
     def get_chat_name(self, chat_id) -> Optional[str]:
         """Возвращает имя чата из кэша аккаунта."""
