@@ -4,6 +4,8 @@
 
 **Полнофункциональный Telegram-бот для автоматизации продаж на FunPay**
 
+**Русский** | [English](README.en.md)
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2ca5e0?logo=telegram&logoColor=white)](https://aiogram.dev)
 [![License](https://img.shields.io/badge/license-Source%20Available-red)](LICENSE)
@@ -22,7 +24,7 @@
 <td width="50%">
 
 ### ⚙️ Основные модули
-- 📈 **Автоподнятие** — по Cardinal-паттерну (двойной raise + точный кулдаун от FunPay)
+- 📈 **Автоподнятие** — по Cardinal-паттерну (точный кулдаун прямо от FunPay)
 - 💬 **Автоответчик** — ключевые слова с regex-границами (нет ложных срабатываний)
 - 📦 **Автовыдача** — статичный текст / файл с ключами / CSV / случайный / инструкция+ключ
 - 🔢 **Мульти-выдача** — N ключей за один заказ
@@ -297,7 +299,7 @@ funpaybot/
 │       └── twofa.py               # TOTP
 ├── modules/
 │   ├── online_keeper.py
-│   ├── auto_lift.py               # Cardinal double-raise pattern
+│   ├── auto_lift.py               # автоподнятие с точным кулдауном FunPay
 │   ├── auto_greeting.py
 │   ├── auto_response.py           # regex word-boundary matching
 │   ├── auto_delivery.py           # 5 типов контента
@@ -323,6 +325,7 @@ funpaybot/
 ├── utils/
 │   ├── logger.py
 │   ├── variables.py               # подстановка $переменных
+│   ├── passwords.py               # bcrypt-хэширование пароля админа
 │   ├── audit_log.py
 │   ├── error_reporter.py
 │   ├── totp.py
@@ -339,6 +342,7 @@ funpaybot/
 ## ⚠️ Важно
 
 - Все секреты (`golden_key`, API-ключи, токен бота) хранятся **локально** в `data/config.json` — никуда не отправляются
+- Пароль администратора хранится в виде **bcrypt-хэша**, а не плейнтекста
 - `data/config.json` добавлен в `.gitignore` — не попадёт в git
 - Антибан-задержки включены по умолчанию (случайные 0.8–2.2 сек между запросами)
 - Не меняй IP во время работы бота — FunPay следит за сменой
