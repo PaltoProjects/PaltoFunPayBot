@@ -3,9 +3,10 @@
 
 Логика (как просил пользователь):
 1. Бот собирает все КАТЕГОРИИ профиля где есть лоты (пустые пропускает).
-2. Для каждой категории пытается поднять.
-3. Если FunPay говорит «Подождите N часов M минут» — бот парсит это время
-   (FunPayAPI.RaiseError делает это сам) и ставит next_attempt_at = now + N часов.
+2. Для каждой категории пытается поднять. raise_lots() возвращает точный
+   кулдаун (секунды) из ответа FunPay — ставим next_attempt_at = now + wait.
+3. Если FunPay говорит «Подождите N часов M минут» (RaiseError) — берём
+   wait_time из исключения.
 4. Реактивный цикл (каждые 30 сек) — поднимает категории у которых пришло время.
 5. Логи Cardinal-стиля:
      I: Поднимаю лоты категории "GTA 5 Online"...
@@ -211,64 +212,47 @@ class AutoLift:
         """
         Пытается поднять одну категорию. Возвращает True при успехе.
 
-        Логика Cardinal (двойной raise):
-          1. Первый raise_lots → реально поднимает лоты.
-          2. Второй raise_lots → сразу получает RaiseError с точным wait_time от FunPay.
-             Это позволяет узнать ТОЧНЫЙ кулдаун вместо фиксированных "4 часа".
+        raise_lots() (Cardinal-форк) при успехе возвращает точный кулдаун
+        в секундах из JSON-ответа FunPay — двойной raise больше не нужен.
         """
         loop = asyncio.get_event_loop()
-        raise_ok = False
 
         try:
-            # ─ Первый вызов: реальное поднятие ──────────────────────────────
-            await loop.run_in_executor(
+            wait = await loop.run_in_executor(
                 None, funpay_client.account.raise_lots, st.game_id,
             )
-            raise_ok = True
-
-            # ─ Второй вызов: получаем точный wait_time от FunPay ────────────
-            # FunPay сразу вернёт RaiseError с полем wait_time — это штатно.
-            # Без этого вызова мы не знаем точный кулдаун и вынуждены угадывать.
-            # Cardinal делает именно так (см. cardinal.py raise_lots()).
-            await asyncio.sleep(1)
-            await loop.run_in_executor(
-                None, funpay_client.account.raise_lots, st.game_id,
+            # wait — из поля "wait" ответа FunPay; если его нет — 4ч по умолчанию
+            wait = int(wait) if wait else 4 * 3600
+            st.schedule_after(wait, reason="успех")
+            logger.info(
+                f'✓ Подняты лоты категории "{st.category_name}". '
+                f'Следующая попытка через {_fmt_time(wait)}.'
             )
-            # Если второй вызов почему-то тоже прошёл — ставим 4ч по умолчанию
-            logger.info(f'✓ Подняты лоты категории "{st.category_name}"')
-            st.schedule_after(4 * 3600, reason="успех")
+            return True
 
         except Exception as e:
             err_type = type(e).__name__
 
             # RaiseError — штатный ответ FunPay с точным временем кулдауна
-            if err_type == "RaiseError" or "RaiseError" in err_type:
+            if "RaiseError" in err_type:
                 wait = getattr(e, "wait_time", None)
                 msg = getattr(e, "error_message", None) or str(e)
 
                 if wait and wait > 0:
                     st.schedule_after(wait, reason=msg)
-                    if raise_ok:
-                        # Первый поднял успешно, второй дал точное время — это норма
-                        logger.info(
-                            f'✓ Подняты лоты категории "{st.category_name}". '
-                            f'Следующая попытка через {_fmt_time(wait)}.'
-                        )
-                    else:
-                        logger.warning(
-                            f'Не удалось поднять лоты категории "{st.category_name}". '
-                            f'FunPay говорит: "{msg}". '
-                            f'Следующая попытка через {_fmt_time(wait)}.'
-                        )
+                    logger.warning(
+                        f'Не удалось поднять лоты категории "{st.category_name}". '
+                        f'FunPay говорит: "{msg}". '
+                        f'Следующая попытка через {_fmt_time(wait)}.'
+                    )
                 else:
                     # wait_time не распарсился — ставим час
                     st.schedule_after(3600, reason=msg)
-                    if not raise_ok:
-                        logger.warning(
-                            f'Не удалось поднять лоты категории "{st.category_name}": {msg}. '
-                            f'Повтор через 1ч.'
-                        )
-                return raise_ok
+                    logger.warning(
+                        f'Не удалось поднять лоты категории "{st.category_name}": {msg}. '
+                        f'Повтор через 1ч.'
+                    )
+                return False
 
             # HTTP 503/403/429 — временная ошибка FunPay, короткий ретрай
             err_str = str(e)
@@ -286,8 +270,6 @@ class AutoLift:
             st.schedule_after(30 * 60, reason=err_str[:200])
             logger.warning(f'Ошибка при поднятии "{st.category_name}": {err_type}: {err_str[:120]}')
             return False
-
-        return raise_ok
 
     # ─── Главный цикл ───────────────────────────────────────────────────────
 
