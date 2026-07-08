@@ -9,6 +9,15 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
+# Windows: при перенаправленном выводе (pipe, > файл) stdout использует
+# cp1251/cp866 и падает на эмодзи. Принудительно UTF-8 с заменой символов.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 def _show_error_and_wait(err_text: str) -> None:
     """Показывает ошибку и держит консоль открытой."""
@@ -236,7 +245,9 @@ def _main_safe() -> None:
                     pwd = secrets.token_urlsafe(12)
                     print(f"📋 Сгенерирован: {pwd}")
                     print("   ❗ Сохраните его!")
-                s.admin_password = pwd
+                # В конфиг пишем bcrypt-хэш, а не плейнтекст
+                from utils.passwords import hash_password
+                s.admin_password = hash_password(pwd)
                 print("✅ Пароль сохранён.\n")
 
             if not f.proxy:

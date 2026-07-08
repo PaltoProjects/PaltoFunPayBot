@@ -72,8 +72,9 @@ async def password_received(msg: types.Message, state: FSMContext) -> None:
 
     # Импорт audit здесь (а не наверху) чтобы избежать циклических импортов
     from utils.audit_log import audit
+    from utils.passwords import verify_password
 
-    if candidate and candidate == s.admin_password:
+    if verify_password(candidate, s.admin_password):
         if user_id not in s.admin_ids:
             s.admin_ids.append(user_id)
             config_manager.save()

@@ -24,7 +24,7 @@ CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 class TelegramSettings(BaseModel):
     """Telegram-бот: токен и список авторизованных пользователей."""
     token: str = ""
-    admin_password: str = ""              # Пароль для входа администратором
+    admin_password: str = ""              # bcrypt-хэш пароля администратора (см. utils/passwords.py)
     manager_keys: List[str] = Field(default_factory=list)  # Ключи регистрации менеджеров
     admin_ids: List[int] = Field(default_factory=list)     # tg-id админов
     manager_ids: List[int] = Field(default_factory=list)   # tg-id менеджеров
@@ -370,6 +370,15 @@ class ConfigManager:
             if not migrations.get("notif_new_messages_default_true"):
                 settings.notifications.new_messages = True
                 migrations["notif_new_messages_default_true"] = True
+                need_save = True
+
+            # Пароль администратора: плейнтекст → bcrypt-хэш.
+            # Без флага миграции: условие самодостаточно (is_hashed), а пароль
+            # мог быть перезаписан плейнтекстом старой версией бота.
+            from utils.passwords import BCRYPT_AVAILABLE, hash_password, is_hashed
+            if (BCRYPT_AVAILABLE and settings.telegram.admin_password
+                    and not is_hashed(settings.telegram.admin_password)):
+                settings.telegram.admin_password = hash_password(settings.telegram.admin_password)
                 need_save = True
 
             # На старых конфигах user_agent был пустым → ставим браузерный.
