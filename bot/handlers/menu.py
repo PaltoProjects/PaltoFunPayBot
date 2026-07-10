@@ -589,6 +589,13 @@ async def auto_withdraw_menu(c: types.CallbackQuery) -> None:
         "Бот периодически проверяет баланс и автоматически выводит средства "
         "по выбранному правилу.\n\n"
     )
+    if len(s().funpay.accounts) > 1:
+        active = s().funpay.active_account()
+        text += (
+            f"👥 Мультиаккаунт: вывод работает только по <b>активному</b> аккаунту "
+            f"(сейчас: <b>{html.escape(active.display_name()) if active else '—'}</b>). "
+            f"Это защита от случайного вывода со всех аккаунтов на одни реквизиты.\n\n"
+        )
     if w.trigger == "schedule":
         sched_label = {"daily": "ежедневно", "weekly": "еженедельно", "monthly": "ежемесячно"}.get(
             w.schedule, w.schedule

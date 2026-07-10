@@ -11,7 +11,7 @@ import asyncio
 import time
 from typing import Optional
 
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 
 
@@ -51,21 +51,20 @@ class ProxyKeepAlive:
             await asyncio.sleep(self.INTERVAL_SEC)
 
     async def _ping(self) -> None:
-        """Лёгкий запрос на FunPay чтобы оживить соединение."""
-        if not funpay_client.account:
+        """Лёгкий запрос на FunPay чтобы оживить соединение (все аккаунты)."""
+        clients = accounts_manager.connected_clients()
+        if not clients:
             return
 
         loop = asyncio.get_event_loop()
         try:
-            # Самый дешёвый запрос — get на главную FunPay
-            # (FunPayAPI имеет метод method который шлёт запрос)
-            await loop.run_in_executor(
-                None,
-                self._do_ping,
-            )
+            # Пингуем каждый подключённый аккаунт — у каждого может быть
+            # свой прокси со своим idle-таймаутом
+            for client in clients:
+                await loop.run_in_executor(None, self._do_ping, client)
             self._fails_in_row = 0
             self._last_success_at = time.time()
-            logger.debug("ProxyKeepAlive: ping OK")
+            logger.debug(f"ProxyKeepAlive: ping OK ({len(clients)} акк.)")
 
         except Exception as e:
             self._fails_in_row += 1
@@ -91,16 +90,16 @@ class ProxyKeepAlive:
                 self._last_success_at = time.time()
                 self._fails_in_row = 0
 
-    def _do_ping(self) -> None:
-        """Синхронная часть ping — вызов FunPay."""
-        if not funpay_client.account:
+    def _do_ping(self, client) -> None:
+        """Синхронная часть ping — вызов FunPay для одного аккаунта."""
+        if not client.account:
             return
         try:
             # Запрашиваем CSRF/баланс — это лёгкий запрос
-            funpay_client.account.get_balance()
+            client.account.get_balance()
         except AttributeError:
             # Если метод изменился — пробуем get_chats
-            funpay_client.account.get_chats(update=True)
+            client.account.get_chats(update=True)
 
 
 proxy_keepalive = ProxyKeepAlive()

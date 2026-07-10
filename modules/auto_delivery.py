@@ -502,7 +502,7 @@ async def handle_order_paid(order) -> None:
             if config_manager.settings.auto_activation.enabled:
                 try:
                     from modules.auto_deactivation import deactivate_lot
-                    await deactivate_lot(lot_id)
+                    await deactivate_lot(lot_id, client=client)
                 except Exception as e:
                     logger.warning(f"auto-deactivate {lot_id}: {e}")
             return

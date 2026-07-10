@@ -429,7 +429,10 @@ class PluginAPI:
 
     Атрибуты:
         api.event_bus       — событийная шина
-        api.funpay_client   — клиент FunPay (.send_message, .get_balance)
+        api.funpay_client   — клиент FunPay АКТИВНОГО аккаунта (.send_message, ...)
+        api.accounts        — менеджер мультиаккаунта (accounts_manager):
+                              .all(), .active(), .client_for(obj) — клиент
+                              аккаунта, породившего событие (по штампу)
         api.config_manager  — глобальный конфиг
         api.logger          — общий логгер
         api.storage         — личное хранилище плагина (PluginStorage)
@@ -460,6 +463,8 @@ class PluginAPI:
         # Базовые ссылки
         self.event_bus = event_bus
         self.funpay_client = funpay_client
+        from core.funpay_client import accounts_manager
+        self.accounts = accounts_manager
         self.config_manager = config_manager
         self.logger = logger
 

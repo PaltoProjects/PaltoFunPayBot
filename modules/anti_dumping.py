@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 
 from config.settings import config_manager
 from core.event_bus import event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.audit_log import audit
 from utils.logger import logger
 
@@ -41,20 +41,20 @@ def _safe_float(v) -> Optional[float]:
     return None
 
 
-async def _get_my_lots() -> list:
+async def _get_my_lots(client) -> list:
     """
-    Возвращает список (lot_id, lot_obj, subcat_id) всех наших активных лотов.
+    Возвращает список (lot_id, lot_obj, subcat_id) активных лотов аккаунта client.
 
     profile.get_sorted_lots(2) → {SubCategory: {lot_id: LotShortcut}}
     Ключи — объекты SubCategory (не int!), значения — dict лотов.
     Аналогично auto_lift._fetch_categories_with_lots().
     """
-    if not funpay_client.account:
+    if not client.account:
         return []
     loop = asyncio.get_event_loop()
     try:
         profile = await loop.run_in_executor(
-            None, funpay_client.account.get_user, funpay_client.account.id
+            None, client.account.get_user, client.account.id
         )
         # get_sorted_lots(2) → {SubCategory: {lot_id: LotShortcut}}
         sorted_lots = profile.get_sorted_lots(2) or {}
@@ -70,25 +70,25 @@ async def _get_my_lots() -> list:
                 out.append((int(lot_id), lot, int(subcat_id)))
         return out
     except Exception as e:
-        logger.warning(f"AntiDumping: не удалось получить мои лоты: {e}")
+        logger.warning(f"AntiDumping [{client.alias}]: не удалось получить мои лоты: {e}")
         return []
 
 
-async def _get_min_competitor_price(subcat_id: int, my_lot_id: int) -> Optional[float]:
+async def _get_min_competitor_price(client, subcat_id: int, my_lot_id: int) -> Optional[float]:
     """
     Возвращает минимальную цену конкурента в подкатегории, исключая наш лот.
 
     Правильный вызов: account.get_subcategory_public_lots(SubCategoryTypes.COMMON, subcat_id)
     Первый аргумент — тип подкатегории (enum), второй — числовой ID.
     """
-    if not funpay_client.account:
+    if not client.account:
         return None
     loop = asyncio.get_event_loop()
     try:
         from FunPayAPI.common.enums import SubCategoryTypes
         all_lots = await loop.run_in_executor(
             None,
-            funpay_client.account.get_subcategory_public_lots,
+            client.account.get_subcategory_public_lots,
             SubCategoryTypes.COMMON,
             subcat_id,
         )
@@ -109,29 +109,29 @@ async def _get_min_competitor_price(subcat_id: int, my_lot_id: int) -> Optional[
         return None
 
 
-async def _deactivate_lot(lot_id: int) -> bool:
+async def _deactivate_lot(client, lot_id: int) -> bool:
     """
-    Деактивирует лот через FunPayAPI.
+    Деактивирует лот через FunPayAPI (на аккаунте client).
 
     Правильный паттерн (из auto_deactivation.py, который работает):
       lot_fields = account.get_lot_fields(lot_id)
       lot_fields.active = False
       account.save_lot(lot_fields)
     """
-    if not funpay_client.account:
+    if not client.account:
         return False
     loop = asyncio.get_event_loop()
     try:
         lot_fields = await loop.run_in_executor(
-            None, funpay_client.account.get_lot_fields, lot_id
+            None, client.account.get_lot_fields, lot_id
         )
         lot_fields.active = False
         await loop.run_in_executor(
-            None, funpay_client.account.save_lot, lot_fields
+            None, client.account.save_lot, lot_fields
         )
         return True
     except Exception as e:
-        logger.warning(f"AntiDumping deactivate({lot_id}): {e}")
+        logger.warning(f"AntiDumping deactivate({lot_id}) [{client.alias}]: {e}")
         return False
 
 
@@ -160,7 +160,7 @@ class AntiDumping:
         while self._running:
             try:
                 cfg = config_manager.settings.anti_dumping
-                if cfg.enabled and funpay_client.account:
+                if cfg.enabled:
                     await self._tick()
             except Exception as e:
                 logger.exception(f"AntiDumping tick error: {e}")
@@ -168,50 +168,57 @@ class AntiDumping:
 
     async def _tick(self) -> None:
         cfg = config_manager.settings.anti_dumping
-        my_lots = await _get_my_lots()
-        if not my_lots:
+        # Мультиаккаунт: проверяем лоты каждого подключённого аккаунта
+        clients = [c for c in accounts_manager.enabled_clients() if c.account]
+        if not clients:
             return
 
         deactivated = []
-        for lot_id, lot, subcat_id in my_lots:
-            my_price = _safe_float(getattr(lot, "price", None))
-            if not my_price or my_price <= 0:
-                continue
+        for client in clients:
+            my_lots = await _get_my_lots(client)
+            for lot_id, lot, subcat_id in my_lots:
+                my_price = _safe_float(getattr(lot, "price", None))
+                if not my_price or my_price <= 0:
+                    continue
 
-            min_competitor = await _get_min_competitor_price(subcat_id, lot_id)
-            if not min_competitor:
-                continue
+                min_competitor = await _get_min_competitor_price(client, subcat_id, lot_id)
+                if not min_competitor:
+                    continue
 
-            # Насколько ниже наша цена?
-            diff_pct = ((my_price - min_competitor) / my_price) * 100
-            if diff_pct < cfg.threshold_percent:
-                continue  # демпинга нет
+                # Насколько ниже наша цена?
+                diff_pct = ((my_price - min_competitor) / my_price) * 100
+                if diff_pct < cfg.threshold_percent:
+                    continue  # демпинга нет
 
-            # Демпинг! Деактивируем
-            ok = await _deactivate_lot(lot_id)
-            if ok:
-                deactivated.append({
-                    "lot_id": lot_id,
-                    "title": getattr(lot, "title", "") or getattr(lot, "description", ""),
-                    "my_price": my_price,
-                    "competitor_price": min_competitor,
-                    "diff_pct": diff_pct,
-                })
-                audit(
-                    user_id=0,
-                    action="ANTI_DUMPING_DEACTIVATE",
-                    data=f"lot={lot_id}",
-                    text=f"my={my_price} comp={min_competitor} diff={diff_pct:.1f}%",
-                )
+                # Демпинг! Деактивируем
+                ok = await _deactivate_lot(client, lot_id)
+                if ok:
+                    deactivated.append({
+                        "lot_id": lot_id,
+                        "title": getattr(lot, "title", "") or getattr(lot, "description", ""),
+                        "my_price": my_price,
+                        "competitor_price": min_competitor,
+                        "diff_pct": diff_pct,
+                        "alias": client.alias,
+                    })
+                    audit(
+                        user_id=0,
+                        action="ANTI_DUMPING_DEACTIVATE",
+                        data=f"lot={lot_id} acc={client.alias}",
+                        text=f"my={my_price} comp={min_competitor} diff={diff_pct:.1f}%",
+                    )
 
         if deactivated and cfg.notify:
             await self._send_report(deactivated)
 
     async def _send_report(self, items: list) -> None:
+        multi = len(accounts_manager.all()) > 1
         lines = [f"⚠️ <b>Авто-снятие демпинга</b>\n"]
         lines.append(f"Снято с публикации лотов: <b>{len(items)}</b>\n")
         for it in items[:10]:
             title = (it["title"] or f"#{it['lot_id']}")[:50]
+            if multi:
+                title = f"[{it['alias']}] {title}"
             lines.append(
                 f"• {title}\n"
                 f"  Наша: <b>{it['my_price']:.0f}₽</b> · "

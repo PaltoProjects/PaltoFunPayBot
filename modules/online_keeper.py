@@ -13,7 +13,7 @@ import asyncio
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 
 
@@ -37,8 +37,10 @@ class OnlineKeeper:
     async def _loop(self) -> None:
         while self._running:
             cfg = config_manager.settings.online_keeper
-            if cfg.enabled and funpay_client.account is not None:
-                logger.debug("OnlineKeeper: ✅ онлайн")
+            if cfg.enabled:
+                n = len(accounts_manager.connected_clients())
+                if n:
+                    logger.debug(f"OnlineKeeper: ✅ онлайн ({n} акк.)")
             await asyncio.sleep(cfg.poll_interval_seconds)
 
 
