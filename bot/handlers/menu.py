@@ -18,9 +18,9 @@ from aiogram.fsm.context import FSMContext
 
 from bot import keyboards as kb
 from bot.handlers.auth import is_admin, is_authorized
-from bot.states import EditStates
+from bot.states import AccountStates, EditStates
 from config.settings import config_manager
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager, funpay_client
 from utils.logger import logger
 
 router = Router(name="menu")
@@ -1183,6 +1183,151 @@ async def menu_system(c: types.CallbackQuery) -> None:
         await c.answer("⛔ Только для админов.", show_alert=True); return
     await c.message.edit_text("🔧 <b>Система и Конфиги</b>", reply_markup=kb.kb_system())
     await c.answer()
+
+
+# ─── Аккаунты FunPay (мультиаккаунт) ─────────────────────────────────────────
+
+def _accounts_view():
+    """(text, markup) для экрана списка аккаунтов."""
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    fp = s().funpay
+    lines = ["👥 <b>Аккаунты FunPay</b>", ""]
+    b = InlineKeyboardBuilder()
+
+    if not fp.accounts:
+        lines.append("Аккаунтов пока нет — нажмите «➕ Добавить аккаунт».")
+    for i, acc in enumerate(fp.accounts):
+        cl = accounts_manager.get(i)
+        online = "🟢" if (cl and cl.account) else "🔴"
+        mark = "▶️" if i == fp.active_index else "▫️"
+        uname = html.escape(acc.username or "—")
+        suffix = "" if acc.enabled else " (выключен)"
+        lines.append(f"{mark} {i + 1}. <b>{html.escape(acc.display_name())}</b> — {uname} {online}{suffix}")
+        b.button(text=f"{mark} {acc.display_name()[:16]}", callback_data=f"acc:sel:{i}")
+        b.button(text="🗑", callback_data=f"acc:del:{i}")
+
+    b.button(text="➕ Добавить аккаунт", callback_data="acc:add")
+    b.button(text="⬅️ Назад", callback_data="menu:system")
+    b.adjust(*([2] * len(fp.accounts) + [1, 1]))
+
+    lines += [
+        "",
+        "▶️ — активный аккаунт: с ним работают /profile, /balance, прокси и golden_key в меню.",
+        "Поллинг и автоматика (ответы, выдача, поднятие) работают на ВСЕХ подключённых.",
+    ]
+    return "\n".join(lines), b.as_markup()
+
+
+async def _render_accounts(c: types.CallbackQuery) -> None:
+    text, markup = _accounts_view()
+    await c.message.edit_text(text, reply_markup=markup)
+    await c.answer()
+
+
+@router.callback_query(F.data == "sys:accounts")
+async def sys_accounts(c: types.CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        await c.answer("⛔ Только для админов.", show_alert=True); return
+    await _render_accounts(c)
+
+
+@router.callback_query(F.data.startswith("acc:sel:"))
+async def acc_select(c: types.CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        await c.answer("⛔ Только для админов.", show_alert=True); return
+    idx = int(c.data.rsplit(":", 1)[1])
+    if idx == s().funpay.active_index:
+        await c.answer("Этот аккаунт уже активен."); return
+    if accounts_manager.set_active(idx):
+        name = s().funpay.accounts[idx].display_name()
+        logger.info(f"Активный аккаунт переключён на: {name}")
+        await c.answer(f"▶️ Активен: {name}")
+    await _render_accounts(c)
+
+
+@router.callback_query(F.data.startswith("acc:del:"))
+async def acc_delete_ask(c: types.CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        await c.answer("⛔ Только для админов.", show_alert=True); return
+    idx = int(c.data.rsplit(":", 1)[1])
+    if not (0 <= idx < len(s().funpay.accounts)):
+        await _render_accounts(c); return
+    name = html.escape(s().funpay.accounts[idx].display_name())
+    await c.message.edit_text(
+        f"🗑 Удалить аккаунт <b>{name}</b>?\n\n"
+        f"Поллинг остановится, настройки подключения будут стёрты из конфига. "
+        f"Общие настройки модулей (автовыдача и т.д.) не затрагиваются.",
+        reply_markup=kb.kb_confirm(f"acc:delok:{idx}", "sys:accounts"),
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("acc:delok:"))
+async def acc_delete(c: types.CallbackQuery) -> None:
+    if not is_admin(c.from_user.id):
+        await c.answer("⛔ Только для админов.", show_alert=True); return
+    idx = int(c.data.rsplit(":", 1)[1])
+    if accounts_manager.remove_account(idx):
+        logger.info(f"Аккаунт #{idx + 1} удалён из мультиаккаунта")
+        await c.answer("Аккаунт удалён.")
+    await _render_accounts(c)
+
+
+@router.callback_query(F.data == "acc:add")
+async def acc_add(c: types.CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(c.from_user.id):
+        await c.answer("⛔ Только для админов.", show_alert=True); return
+    await c.message.answer(
+        "➕ <b>Новый аккаунт FunPay</b>\n\n"
+        "🔑 Отправьте <b>golden_key</b> аккаунта (32 символа).\n\n"
+        "Как получить: funpay.com (в браузере, под нужным аккаунтом) → F12 → "
+        "Application → Cookies → <code>golden_key</code>\n\n"
+        "⚠️ Если аккаунт работает через свой прокси — его можно назначить после "
+        "добавления: переключитесь на аккаунт и задайте прокси в 🌐 Прокси.",
+        reply_markup=kb.kb_cancel_edit("sys:accounts"),
+    )
+    await state.set_state(AccountStates.waiting_golden_key)
+    await c.answer()
+
+
+@router.message(AccountStates.waiting_golden_key)
+async def account_golden_key_received(msg: types.Message, state: FSMContext) -> None:
+    import asyncio as _asyncio
+    from core.proxy_check import validate_golden_key
+
+    key = (msg.text or "").strip()
+    ok, err = validate_golden_key(key)
+    if not ok:
+        await msg.answer(f"❌ {err}\nОтправьте golden_key ещё раз:")
+        return
+    if any(a.golden_key == key for a in s().funpay.accounts):
+        await msg.answer("❌ Аккаунт с таким golden_key уже добавлен. Отправьте другой ключ:")
+        return
+
+    await state.clear()
+    idx, client = accounts_manager.add_account(key)
+    status = await msg.answer("✅ Ключ принят!\n🚀 Подключаюсь к FunPay...")
+
+    loop = _asyncio.get_event_loop()
+    success, message_txt = await loop.run_in_executor(None, client.connect)
+    if not success:
+        accounts_manager.remove_account(idx)
+        await status.edit_text(
+            f"❌ Не удалось подключиться, аккаунт не добавлен.\n\n"
+            f"<code>{html.escape(str(message_txt)[:500])}</code>\n\n"
+            f"Проверьте ключ и попробуйте снова: 👥 Аккаунты → ➕ Добавить."
+        )
+        return
+
+    await client.start_polling()
+    acc = s().funpay.accounts[idx]
+    await status.edit_text(
+        f"✅ Аккаунт <b>{html.escape(acc.display_name())}</b> "
+        f"(ID <code>{acc.account_id}</code>) добавлен и поллится.\n\n"
+        f"Сделать его активным: /menu → 🔧 Система → 👥 Аккаунты FunPay."
+    )
+    logger.info(f"Мультиаккаунт: добавлен аккаунт {acc.display_name()} (ID {acc.account_id})")
 
 
 @router.callback_query(F.data == "sys:notifs")

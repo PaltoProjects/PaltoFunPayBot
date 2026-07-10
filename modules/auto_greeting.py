@@ -12,7 +12,7 @@ from pathlib import Path
 
 from config.settings import config_manager
 from core.event_bus import event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 from utils.variables import send_with_vars
 
@@ -71,11 +71,13 @@ async def handle_new_chat(chat) -> None:
     if time.time() - last_ts < cooldown_sec:
         return
 
+    # Приветствуем через аккаунт, в который постучался покупатель
+    client = accounts_manager.client_for(chat)
     ok = await send_with_vars(
         cfg.text,
-        funpay_client.send_message,
+        client.send_message,
         chat_id,
-        account=funpay_client.account,
+        account=client.account,
         username=chat_name,
         chat_name=chat_name,
     )

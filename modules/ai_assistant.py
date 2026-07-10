@@ -25,7 +25,7 @@ import aiohttp
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 
 PENDING_PATH = Path(__file__).resolve().parent.parent / "data" / "ai_pending.json"
@@ -63,7 +63,9 @@ async def track_message(message) -> None:
     chat_id = getattr(message, "chat_id", None)
     author_id = getattr(message, "author_id", None)
     text = getattr(message, "text", "") or ""
-    own_id = config_manager.settings.funpay.account_id
+    # Мультиаккаунт: сообщение обрабатывает аккаунт, на который оно пришло
+    client = accounts_manager.client_for(message)
+    own_id = client.own_id
 
     if not chat_id:
         return
@@ -82,6 +84,7 @@ async def track_message(message) -> None:
                 "username": getattr(message, "author", "") or "",
                 "text": text[:500],
                 "ai_replied": False,
+                "acc": client.index,  # каким аккаунтом отвечать
             }
         _save_pending(pending)
 
@@ -146,7 +149,8 @@ class AIAssistant:
             if not answer:
                 continue
 
-            sent = funpay_client.send_message(int(chat_id_str), answer)
+            client = accounts_manager.get(data.get("acc")) or accounts_manager.active()
+            sent = client.send_message(int(chat_id_str), answer)
             if sent:
                 # Шаг 3: обновляем только этот чат под блокировкой
                 async with _pending_lock:

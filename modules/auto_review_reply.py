@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 from utils.variables import send_with_vars
 
@@ -59,7 +59,9 @@ async def handle_review(review) -> None:
     reviewer    = getattr(review, "author", "") or getattr(review, "buyer_username", "") or ""
     review_text = getattr(review, "text", "") or ""
 
-    if funpay_client.account is None:
+    # Отвечаем через аккаунт, на который пришёл отзыв (мультиаккаунт)
+    client = accounts_manager.client_for(review)
+    if client.account is None:
         return
 
     # Подстановка переменных (send_review — не send_message, делаем sub вручную)
@@ -76,11 +78,11 @@ async def handle_review(review) -> None:
     text = _truncate_review_text(text)
 
     try:
-        funpay_client.account.send_review(order_id, text, stars=stars)
+        client.account.send_review(order_id, text, stars=stars)
         logger.info(f"review_reply → заказ {order_id} ({stars}★)")
     except Exception as e:
         try:
-            funpay_client.account.send_review_reply(order_id, text)
+            client.account.send_review_reply(order_id, text)
             logger.info(f"review_reply (legacy) → {order_id}")
         except Exception as e2:
             logger.warning(f"review_reply: {e} / {e2}")

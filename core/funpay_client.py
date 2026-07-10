@@ -71,9 +71,16 @@ except (TypeError, SyntaxError) as _e:
 
 
 class FunPayClient:
-    """Высокоуровневая обёртка над FunPayAPI."""
+    """
+    Высокоуровневая обёртка над FunPayAPI — один клиент на один FunPay-аккаунт.
 
-    def __init__(self) -> None:
+    acc_cfg — настройки конкретного аккаунта (FunPayAccountSettings);
+    None = legacy-режим, читаем глобальные settings.funpay (активный аккаунт).
+    """
+
+    def __init__(self, acc_cfg: Optional[Any] = None) -> None:
+        self.acc_cfg = acc_cfg
+        self.index: int = 0  # позиция в списке аккаунтов (ставит менеджер)
         self.account: Optional[Any] = None
         self.runner:  Optional[Any] = None
         self._running: bool = False
@@ -94,6 +101,33 @@ class FunPayClient:
         self._old_mode_fallback: bool = False
         self._fallback_last_emitted: Dict[int, str] = {}  # chat_id → последний эмитнутый текст
 
+    # ─── Настройки этого аккаунта ─────────────────────────────────────────────
+
+    def _cfg(self) -> Any:
+        """Настройки этого аккаунта (или legacy-глобальные, если acc_cfg нет)."""
+        return self.acc_cfg if self.acc_cfg is not None else config_manager.settings.funpay
+
+    @property
+    def alias(self) -> str:
+        if self.acc_cfg is not None:
+            return self.acc_cfg.display_name()
+        return config_manager.settings.funpay.username or f"#{self.index + 1}"
+
+    @property
+    def own_id(self) -> Optional[int]:
+        """ID аккаунта FunPay, которым управляет этот клиент."""
+        return self._cfg().account_id
+
+    def _sync_if_active(self) -> None:
+        """
+        Если этот клиент управляет АКТИВНЫМ аккаунтом — обновляем legacy-вид
+        (settings.funpay.golden_key и т.д.) перед save(), иначе save()
+        скопирует устаревший legacy обратно поверх наших свежих данных.
+        """
+        fp = config_manager.settings.funpay
+        if self.acc_cfg is not None and fp.active_account() is self.acc_cfg:
+            fp.sync_legacy_from_active()
+
     # ─── Подключение ──────────────────────────────────────────────────────────
 
     def connect(self) -> Tuple[bool, str]:
@@ -102,7 +136,7 @@ class FunPayClient:
                 f"FunPayAPI не загрузилась: {FUNPAY_IMPORT_ERROR}. "
                 "Установите: pip install FunPayAPI"
             )
-        cfg = config_manager.settings.funpay
+        cfg = self._cfg()
         if not cfg.golden_key:
             return False, "Не задан golden_key."
 
@@ -116,6 +150,7 @@ class FunPayClient:
             logger.warning(f"⚠️ Принудительно использую браузерный UA: Chrome 109")
             logger.warning(f"⚠️ Чтобы поменять — запустите: python main.py --setup-ua")
             cfg.user_agent = DEFAULT_UA
+            self._sync_if_active()
             config_manager.save()
 
         try:
@@ -133,6 +168,7 @@ class FunPayClient:
             ).get()
             cfg.account_id = self.account.id
             cfg.username   = self.account.username
+            self._sync_if_active()
             config_manager.save()
 
             # Cardinal-стиль приветствие
@@ -327,6 +363,16 @@ class FunPayClient:
         """
         Маппинг событий FunPayAPI → event_bus.
         """
+        # Штампуем объекты события индексом аккаунта-источника: обработчики
+        # (автоответ, выдача и т.д.) отвечают через тот же аккаунт
+        # (accounts_manager.client_for(obj)).
+        for attr in ("message", "order", "chat"):
+            obj = getattr(ev, attr, None)
+            if obj is not None:
+                try:
+                    setattr(obj, "_palto_acc", self.index)
+                except Exception:
+                    pass
         try:
             await self._dispatch_inner(ev)
         except Exception as e:
@@ -535,6 +581,7 @@ class FunPayClient:
         msg.image_link = None
         msg.by_bot = bool(getattr(chat, "last_by_bot", False))
         msg.type = None  # MessageTypes.NON_SYSTEM по умолчанию
+        msg._palto_acc = self.index  # маршрутизация ответа в этот аккаунт
 
         await event_bus.emit(Event.NEW_MESSAGE, msg)
 
@@ -727,4 +774,171 @@ class FunPayClient:
         return None
 
 
-funpay_client = FunPayClient()
+# ──────────────────────────────────────────────────────────────────────────────
+# Мультиаккаунт: менеджер клиентов
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FunPayAccountsManager:
+    """
+    Держит по FunPayClient на каждый аккаунт из settings.funpay.accounts.
+    Все включённые аккаунты поллятся одновременно; «активный» — тот, с которым
+    работают команды (/profile, /balance) и legacy-код через funpay_client.
+    """
+
+    def __init__(self) -> None:
+        self.clients: List[FunPayClient] = []
+        self._default: Optional[FunPayClient] = None  # legacy-режим без accounts
+
+    # ─── Жизненный цикл ─────────────────────────────────────────────────────
+
+    def load_from_config(self) -> None:
+        """Пересоздаёт клиентов по списку аккаунтов из конфига."""
+        self.stop_all()
+        self.clients = []
+        for i, acc in enumerate(config_manager.settings.funpay.accounts):
+            cl = FunPayClient(acc)
+            cl.index = i
+            self.clients.append(cl)
+
+    async def start_all(self) -> List[Tuple["FunPayClient", bool, str]]:
+        """Подключает и запускает поллинг всех включённых аккаунтов."""
+        loop = asyncio.get_event_loop()
+        results: List[Tuple[FunPayClient, bool, str]] = []
+        for cl in self.enabled_clients():
+            if not cl._cfg().golden_key:
+                continue
+            ok, message = await loop.run_in_executor(None, cl.connect)
+            if ok:
+                await cl.start_polling()
+                logger.info(f"[{cl.alias}] аккаунт подключён и поллится")
+            else:
+                logger.error(f"[{cl.alias}] FunPay не подключился: {message}")
+            results.append((cl, ok, message))
+        return results
+
+    def stop_all(self) -> None:
+        for cl in self.all():
+            cl.stop()
+
+    # ─── Доступ к клиентам ──────────────────────────────────────────────────
+
+    def all(self) -> List[FunPayClient]:
+        if self.clients:
+            return list(self.clients)
+        if self._default is not None:
+            return [self._default]
+        return []
+
+    def enabled_clients(self) -> List[FunPayClient]:
+        return [c for c in self.all() if c.acc_cfg is None or c.acc_cfg.enabled]
+
+    def connected_clients(self) -> List[FunPayClient]:
+        return [c for c in self.all() if c.account is not None]
+
+    def active(self) -> FunPayClient:
+        """Клиент активного аккаунта. Всегда возвращает объект."""
+        if self.clients:
+            idx = config_manager.settings.funpay.active_index
+            if not (0 <= idx < len(self.clients)):
+                idx = 0
+            return self.clients[idx]
+        if self._default is None:
+            self._default = FunPayClient()
+        return self._default
+
+    def get(self, index: Any) -> Optional[FunPayClient]:
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            return None
+        clients = self.all()
+        if 0 <= idx < len(clients):
+            return clients[idx]
+        return None
+
+    def client_for(self, obj: Any) -> FunPayClient:
+        """
+        Клиент аккаунта, породившего событие (по штампу _palto_acc).
+        Fallback — активный аккаунт.
+        """
+        cl = self.get(getattr(obj, "_palto_acc", None))
+        return cl if cl is not None else self.active()
+
+    def tag(self, obj: Any = None, index: Any = None) -> str:
+        """Префикс '[алиас] ' для уведомлений — только когда аккаунтов > 1."""
+        if len(self.all()) <= 1:
+            return ""
+        if obj is not None:
+            cl = self.client_for(obj)
+        else:
+            cl = self.get(index) or self.active()
+        return f"[{cl.alias}] "
+
+    # ─── Управление списком аккаунтов ───────────────────────────────────────
+
+    def add_account(self, golden_key: str, proxy: str = "",
+                    user_agent: str = "") -> Tuple[int, FunPayClient]:
+        from config.settings import DEFAULT_USER_AGENT, FunPayAccountSettings
+        fp = config_manager.settings.funpay
+        acc = FunPayAccountSettings(
+            golden_key=golden_key.strip(),
+            proxy=proxy,
+            user_agent=user_agent or DEFAULT_USER_AGENT,
+        )
+        fp.accounts.append(acc)
+        cl = FunPayClient(acc)
+        cl.index = len(fp.accounts) - 1
+        self.clients.append(cl)
+        if len(fp.accounts) == 1:
+            fp.active_index = 0
+            fp.sync_legacy_from_active()
+        config_manager.save()
+        return cl.index, cl
+
+    def remove_account(self, index: int) -> bool:
+        fp = config_manager.settings.funpay
+        if not (0 <= index < len(fp.accounts)):
+            return False
+        if index < len(self.clients):
+            self.clients[index].stop()
+            self.clients.pop(index)
+        fp.accounts.pop(index)
+        for i, cl in enumerate(self.clients):
+            cl.index = i
+        if fp.active_index >= len(fp.accounts):
+            fp.active_index = max(0, len(fp.accounts) - 1)
+        if fp.accounts:
+            fp.sync_legacy_from_active()
+        else:
+            fp.golden_key = ""
+            fp.account_id = None
+            fp.username = None
+        config_manager.save()
+        return True
+
+    def set_active(self, index: int) -> bool:
+        fp = config_manager.settings.funpay
+        if not (0 <= index < len(fp.accounts)):
+            return False
+        fp.active_index = index
+        fp.sync_legacy_from_active()
+        config_manager.save()
+        return True
+
+
+accounts_manager = FunPayAccountsManager()
+accounts_manager.load_from_config()
+
+
+class _ActiveClientProxy:
+    """
+    Обратная совместимость: модуль-синглтон funpay_client теперь указывает
+    на клиента АКТИВНОГО аккаунта. Весь legacy-код (`funpay_client.account`,
+    `.send_message`, `.get_balance`, ...) продолжает работать без правок.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(accounts_manager.active(), name)
+
+
+funpay_client = _ActiveClientProxy()

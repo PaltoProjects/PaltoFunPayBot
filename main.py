@@ -366,18 +366,25 @@ def _main_safe() -> None:
 
         async def start_funpay_if_configured() -> None:
             fp = config_manager.settings.funpay
-            if not fp.golden_key:
+            if not fp.accounts and not fp.golden_key:
                 logger.info("FunPay не настроен — введите golden_key в Telegram-боте.")
                 return
             if not FUNPAY_AVAILABLE:
                 logger.warning("FunPayAPI не установлена. pip install FunPayAPI")
                 return
-            loop = asyncio.get_event_loop()
-            success, message = await loop.run_in_executor(None, funpay_client.connect)
-            if not success:
-                logger.error(f"FunPay не подключился: {message}")
+
+            # Мультиаккаунт: подключаем и поллим ВСЕ включённые аккаунты
+            from core.funpay_client import accounts_manager
+            accounts_manager.load_from_config()
+            results = await accounts_manager.start_all()
+            ok_count = sum(1 for _, ok, _ in results if ok)
+            total = len(results)
+            if total > 1:
+                logger.info(f"Мультиаккаунт: подключено {ok_count} из {total} аккаунтов.")
+            if not ok_count:
+                logger.error("Ни один FunPay-аккаунт не подключился.")
                 return
-            asyncio.create_task(funpay_client.start_polling())
+            loop = asyncio.get_event_loop()
 
             # Дозаполняем названия лотов для сопоставления автовыдачи
             # (старые конфиги без match_text). В фоне, чтобы не тормозить старт.
@@ -504,8 +511,9 @@ def _main_safe() -> None:
                     await event_bus.emit(Event.BOT_STOPPED)
                 except Exception as e:
                     logger.warning(f"Не удалось отправить BOT_STOPPED: {e}")
-                # Потом закрываем всё
-                funpay_client.stop()
+                # Потом закрываем всё (все аккаунты мультиаккаунта)
+                from core.funpay_client import accounts_manager
+                accounts_manager.stop_all()
                 try:
                     await bot.session.close()
                 except Exception:

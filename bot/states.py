@@ -12,6 +12,12 @@ class SetupStates(StatesGroup):
     waiting_golden_key = State()
 
 
+class AccountStates(StatesGroup):
+    """Добавление нового FunPay-аккаунта (мультиаккаунт)."""
+    waiting_golden_key = State()
+    waiting_alias = State()
+
+
 class EditStates(StatesGroup):
     """Редактирование настраиваемых полей через меню."""
     editing_text = State()

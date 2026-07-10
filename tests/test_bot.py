@@ -231,3 +231,84 @@ def test_fallback_not_triggered_when_new_message_fresh():
 
     assert c._old_mode_fallback is False
     assert emitted == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Мультиаккаунт
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_config_multiaccount_migration(tmp_path):
+    """Legacy-поля funpay.* мигрируют в accounts[0]."""
+    from config.settings import ConfigManager, Settings
+
+    cfg_path = tmp_path / "config.json"
+    s = Settings()
+    s.funpay.golden_key = "k" * 32
+    s.funpay.username = "seller"
+    s.funpay.account_id = 42
+    s.funpay.proxy = "1.2.3.4:8080"
+    cfg_path.write_text(json.dumps(s.model_dump(), ensure_ascii=False), encoding="utf-8")
+
+    cm = ConfigManager(cfg_path)
+    fp = cm.settings.funpay
+    assert len(fp.accounts) == 1
+    acc = fp.accounts[0]
+    assert acc.golden_key == "k" * 32
+    assert acc.username == "seller"
+    assert acc.account_id == 42
+    assert acc.proxy == "1.2.3.4:8080"
+    assert fp.active_account() is acc
+    # legacy-вид синхронизирован
+    assert fp.golden_key == acc.golden_key
+
+    # Повторная загрузка не создаёт дубликат
+    cm2 = ConfigManager(cfg_path)
+    assert len(cm2.settings.funpay.accounts) == 1
+
+
+def test_accounts_manager_routing_and_tag():
+    """client_for идёт по штампу _palto_acc; tag только при >1 аккаунте."""
+    from config.settings import FunPayAccountSettings, config_manager
+    from core.funpay_client import FunPayAccountsManager
+
+    fp = config_manager.settings.funpay
+    saved_accounts, saved_idx = fp.accounts, fp.active_index
+    try:
+        fp.accounts = [
+            FunPayAccountSettings(alias="A", golden_key="a" * 32),
+            FunPayAccountSettings(alias="B", golden_key="b" * 32),
+        ]
+        fp.active_index = 0
+
+        mgr = FunPayAccountsManager()
+        mgr.load_from_config()
+        assert [c.alias for c in mgr.all()] == ["A", "B"]
+        assert mgr.active().alias == "A"
+
+        class Obj:
+            pass
+
+        stamped = Obj()
+        stamped._palto_acc = 1
+        assert mgr.client_for(stamped).alias == "B"
+
+        unstamped = Obj()
+        assert mgr.client_for(unstamped).alias == "A"  # fallback — активный
+
+        assert mgr.tag(stamped) == "[B] "
+        assert mgr.tag(unstamped) == "[A] "
+
+        # Один аккаунт — тегов нет
+        fp.accounts = fp.accounts[:1]
+        mgr.load_from_config()
+        assert mgr.tag(stamped) == ""
+    finally:
+        fp.accounts, fp.active_index = saved_accounts, saved_idx
+
+
+def test_quick_reply_token_parse():
+    from bot.handlers.quick_reply import _parse_token
+
+    assert _parse_token("12345@1") == ("12345", 1)
+    assert _parse_token("12345") == ("12345", -1)
+    assert _parse_token("12345@oops") == ("12345", -1)

@@ -34,18 +34,70 @@ class TelegramSettings(BaseModel):
     twofa_secret: str = ""                # секрет для генерации TOTP-кода (RFC 6238)
 
 
-class FunPaySettings(BaseModel):
-    """FunPay-аккаунт: golden_key и прокси."""
+# ВАЖНО: User-Agent должен быть реальным браузерным! Без него FunPay
+# видит python-requests и не отдаёт чаты. Cardinal использует именно этот.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+)
+
+
+class FunPayAccountSettings(BaseModel):
+    """Один FunPay-аккаунт (мультиаккаунт)."""
+    alias: str = ""                       # отображаемое имя (пусто = username)
     golden_key: str = ""
     proxy: str = ""                       # формат login:pass@ip:port или ip:port
-    # ВАЖНО: User-Agent должен быть реальным браузерным! Без него FunPay
-    # видит python-requests и не отдаёт чаты. Cardinal использует именно этот.
-    user_agent: str = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
-    )
+    user_agent: str = DEFAULT_USER_AGENT
     account_id: Optional[int] = None      # сохраняем после успешного коннекта
     username: Optional[str] = None
+    enabled: bool = True                  # выключенные аккаунты не поллятся
+
+    def display_name(self) -> str:
+        if self.alias:
+            return self.alias
+        if self.username:
+            return self.username
+        if self.account_id:
+            return f"ID {self.account_id}"
+        return "новый аккаунт"
+
+
+class FunPaySettings(BaseModel):
+    """
+    FunPay-аккаунты.
+
+    С мультиаккаунтом источник правды — список accounts + active_index.
+    Legacy-поля (golden_key и т.д.) — «вид» АКТИВНОГО аккаунта: старый код
+    читает и пишет их как раньше; синхронизация двусторонняя —
+    sync_legacy_from_active() при загрузке/переключении, обратное копирование
+    legacy → активный аккаунт в ConfigManager.save().
+    """
+    golden_key: str = ""
+    proxy: str = ""                       # формат login:pass@ip:port или ip:port
+    user_agent: str = DEFAULT_USER_AGENT
+    account_id: Optional[int] = None      # сохраняем после успешного коннекта
+    username: Optional[str] = None
+
+    accounts: List[FunPayAccountSettings] = Field(default_factory=list)
+    active_index: int = 0
+
+    def active_account(self) -> Optional[FunPayAccountSettings]:
+        if not self.accounts:
+            return None
+        idx = self.active_index
+        if not (0 <= idx < len(self.accounts)):
+            idx = 0
+        return self.accounts[idx]
+
+    def sync_legacy_from_active(self) -> None:
+        acc = self.active_account()
+        if acc is None:
+            return
+        self.golden_key = acc.golden_key
+        self.proxy = acc.proxy
+        self.user_agent = acc.user_agent
+        self.account_id = acc.account_id
+        self.username = acc.username
 
 
 class AutoLiftSettings(BaseModel):
@@ -302,7 +354,7 @@ class ResponseTemplatesSettings(BaseModel):
 
 class Settings(BaseModel):
     """Корневая модель всех настроек бота."""
-    version: str = "1.1"
+    version: str = "1.2"
     setup_completed: bool = False
 
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
@@ -385,12 +437,34 @@ class ConfigManager:
             # Без него FunPay видит python-requests/2.28.1 и не отдаёт чаты.
             if not migrations.get("user_agent_browser_default"):
                 if not settings.funpay.user_agent or "python-requests" in settings.funpay.user_agent:
-                    settings.funpay.user_agent = (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
-                    )
+                    settings.funpay.user_agent = DEFAULT_USER_AGENT
                 migrations["user_agent_browser_default"] = True
                 need_save = True
+
+            # Мультиаккаунт: legacy-поля funpay.* → accounts[0]
+            if settings.funpay.golden_key and not settings.funpay.accounts:
+                settings.funpay.accounts = [FunPayAccountSettings(
+                    golden_key=settings.funpay.golden_key,
+                    proxy=settings.funpay.proxy,
+                    user_agent=settings.funpay.user_agent,
+                    account_id=settings.funpay.account_id,
+                    username=settings.funpay.username,
+                )]
+                settings.funpay.active_index = 0
+                need_save = True
+
+            # Версия в конфиге — информационная, всегда равна версии кода
+            code_version = Settings.model_fields["version"].default
+            if settings.version != code_version:
+                settings.version = code_version
+                need_save = True
+
+            # Клампим active_index и синхронизируем legacy-вид с активным
+            if settings.funpay.accounts:
+                if not (0 <= settings.funpay.active_index < len(settings.funpay.accounts)):
+                    settings.funpay.active_index = 0
+                    need_save = True
+                settings.funpay.sync_legacy_from_active()
 
             if need_save:
                 # Пишем миграции прямо в файл (pydantic-модель их не хранит)
@@ -439,6 +513,18 @@ class ConfigManager:
 
     def save(self) -> None:
         with self._lock:
+            # Legacy-поля funpay.* — «вид» активного аккаунта: правки старого
+            # кода (смена golden_key/прокси/UA через меню) протаскиваем в него.
+            # При переключении аккаунта сначала вызывается
+            # sync_legacy_from_active(), поэтому копирование здесь — no-op.
+            fp = self.settings.funpay
+            acc = fp.active_account()
+            if acc is not None:
+                acc.golden_key = fp.golden_key
+                acc.proxy = fp.proxy
+                acc.user_agent = fp.user_agent
+                acc.account_id = fp.account_id
+                acc.username = fp.username
             self._write(self.settings)
 
     def update(self, **kwargs: Any) -> None:

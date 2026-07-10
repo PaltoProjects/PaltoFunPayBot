@@ -9,7 +9,7 @@ import re
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 from utils.variables import send_with_vars
 
@@ -18,7 +18,10 @@ from utils.variables import send_with_vars
 async def handle_new_message(message) -> None:
     cfg = config_manager.settings.auto_response
 
-    if getattr(message, "author_id", None) == config_manager.settings.funpay.account_id:
+    # Отвечаем через аккаунт, на который пришло сообщение (мультиаккаунт)
+    client = accounts_manager.client_for(message)
+
+    if getattr(message, "author_id", None) == client.own_id:
         return
 
     author    = getattr(message, "author", "") or ""
@@ -46,9 +49,9 @@ async def handle_new_message(message) -> None:
             continue
         await send_with_vars(
             response,
-            funpay_client.send_message,
+            client.send_message,
             chat_id,
-            account=funpay_client.account,
+            account=client.account,
             username=author,
             chat_name=chat_name,
             message_text=getattr(message, "text", "") or "",

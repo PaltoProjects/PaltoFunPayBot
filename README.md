@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://python.org)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2ca5e0?logo=telegram&logoColor=white)](https://aiogram.dev)
 [![License](https://img.shields.io/badge/license-Source%20Available-red)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1-orange)](https://github.com/PaltoProjects/PaltoFunPayBot)
+[![Version](https://img.shields.io/badge/version-1.2-orange)](https://github.com/PaltoProjects/PaltoFunPayBot)
 [![CI](https://github.com/PaltoProjects/PaltoFunPayBot/actions/workflows/ci.yml/badge.svg)](https://github.com/PaltoProjects/PaltoFunPayBot/actions/workflows/ci.yml)
 [![FunPay parser](https://github.com/PaltoProjects/PaltoFunPayBot/actions/workflows/canary.yml/badge.svg)](https://github.com/PaltoProjects/PaltoFunPayBot/actions/workflows/canary.yml)
 
@@ -61,6 +61,7 @@
 <td width="50%">
 
 ### 🔧 Система
+- 👥 **Мультиаккаунт** — несколько FunPay-аккаунтов в одном боте: все поллятся одновременно, ответы/выдача уходят с нужного аккаунта
 - 🔔 Тонкая настройка уведомлений по типам событий
 - 🧩 **Система плагинов** — своя бизнес-логика без правки кода
 - 💧 Водяной знак на исходящие сообщения

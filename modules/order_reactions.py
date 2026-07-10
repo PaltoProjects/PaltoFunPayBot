@@ -9,7 +9,7 @@ import asyncio
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 from utils.variables import send_with_vars
 
@@ -29,29 +29,33 @@ async def handle_order_confirmed(order) -> None:
     order_desc  = str(getattr(order, "description", "") or "")
     chat_name   = buyer
 
+    # Отвечаем через аккаунт, на который пришёл заказ (мультиаккаунт)
+    client = accounts_manager.client_for(order)
+
     sub_kw = dict(
         username=buyer,
         chat_name=chat_name,
         order_id=order_id,
         order_price=order_price,
         order_desc=order_desc,
-        account=funpay_client.account,
+        account=client.account,
     )
 
     # 1) Сразу отвечаем
     if cfg_confirm.enabled and cfg_confirm.text:
-        await send_with_vars(cfg_confirm.text, funpay_client.send_message, chat_id, **sub_kw)
+        await send_with_vars(cfg_confirm.text, client.send_message, chat_id, **sub_kw)
         logger.info(f"order_confirm_reply → заказ {order_id}, покупатель {buyer}")
 
     # 2) Через delay просим отзыв
     if cfg_review.enabled and cfg_review.text:
         delay = max(0, cfg_review.delay_minutes) * 60
         asyncio.create_task(_ask_review_later(
-            chat_id, cfg_review.text, delay, order_id=order_id, sub_kw=sub_kw
+            client, chat_id, cfg_review.text, delay, order_id=order_id, sub_kw=sub_kw
         ))
 
 
-async def _ask_review_later(chat_id: int, text: str, delay: int, order_id: str, sub_kw: dict) -> None:
+async def _ask_review_later(client, chat_id: int, text: str, delay: int,
+                            order_id: str, sub_kw: dict) -> None:
     await asyncio.sleep(delay)
-    await send_with_vars(text, funpay_client.send_message, chat_id, **sub_kw)
+    await send_with_vars(text, client.send_message, chat_id, **sub_kw)
     logger.info(f"ask_review → заказ {order_id} (delay {delay}s)")

@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 
 
@@ -94,9 +94,10 @@ def _fmt_time_ago(seconds: int) -> str:
 # Получение категорий с лотами
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _fetch_categories_with_lots() -> List[Tuple[int, str]]:
+async def _fetch_categories_with_lots(client) -> List[Tuple[int, str]]:
     """
-    Возвращает [(category_id (game), name)] — категории игр у которых есть лоты.
+    Возвращает [(category_id (game), name)] — категории игр у которых есть лоты
+    на аккаунте, которым управляет client.
 
     Работает как в FunPayCardinal:
         for subcat in profile.get_sorted_lots(2).keys():
@@ -105,15 +106,15 @@ async def _fetch_categories_with_lots() -> List[Tuple[int, str]]:
     get_sorted_lots(2) возвращает {SubCategory: {lot_id: LotShortcut}} —
     то есть в ключах уже только подкатегории где есть лоты.
     """
-    if not funpay_client.account:
+    if not client.account:
         return []
     loop = asyncio.get_event_loop()
     try:
         profile = await loop.run_in_executor(
-            None, funpay_client.account.get_user, funpay_client.account.id
+            None, client.account.get_user, client.account.id
         )
     except Exception as e:
-        logger.warning(f"Не удалось получить профиль: {e}")
+        logger.warning(f"[{client.alias}] Не удалось получить профиль: {e}")
         return []
 
     try:
@@ -165,9 +166,10 @@ class AutoLift:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._running = False
-        # game_id → CategoryState
-        self._states: Dict[int, CategoryState] = {}
-        self._categories_loaded_at: float = 0.0
+        # (индекс аккаунта, game_id) → CategoryState
+        self._states: Dict[Tuple[int, int], CategoryState] = {}
+        # индекс аккаунта → время последней загрузки категорий
+        self._categories_loaded_at: Dict[int, float] = {}
         self._first_run_logged = False
 
     async def start(self) -> None:
@@ -184,23 +186,25 @@ class AutoLift:
 
     # ─── Обновление списка категорий ────────────────────────────────────────
 
-    async def _refresh_categories(self) -> None:
-        """Раз в час обновляем список категорий с лотами."""
-        cats = await _fetch_categories_with_lots()
-        seen_ids = set()
+    async def _refresh_categories(self, client) -> None:
+        """Раз в час обновляем список категорий с лотами (для одного аккаунта)."""
+        acc = client.index
+        cats = await _fetch_categories_with_lots(client)
+        seen_keys = set()
         for gid, name in cats:
-            seen_ids.add(gid)
-            if gid not in self._states:
-                self._states[gid] = CategoryState(gid, name)
+            key = (acc, gid)
+            seen_keys.add(key)
+            if key not in self._states:
+                self._states[key] = CategoryState(gid, name)
             else:
-                self._states[gid].category_name = name
+                self._states[key].category_name = name
 
-        # Удаляем категории которых больше нет
-        for gid in list(self._states.keys()):
-            if gid not in seen_ids:
-                del self._states[gid]
+        # Удаляем категории которых больше нет (только этого аккаунта)
+        for key in list(self._states.keys()):
+            if key[0] == acc and key not in seen_keys:
+                del self._states[key]
 
-        self._categories_loaded_at = time.time()
+        self._categories_loaded_at[acc] = time.time()
 
         if not self._first_run_logged:
             self._first_run_logged = True
@@ -208,9 +212,9 @@ class AutoLift:
 
     # ─── Поднятие одной категории ───────────────────────────────────────────
 
-    async def _try_lift_one(self, st: CategoryState) -> bool:
+    async def _try_lift_one(self, client, st: CategoryState) -> bool:
         """
-        Пытается поднять одну категорию. Возвращает True при успехе.
+        Пытается поднять одну категорию (аккаунтом client). True при успехе.
 
         raise_lots() (Cardinal-форк) при успехе возвращает точный кулдаун
         в секундах из JSON-ответа FunPay — двойной raise больше не нужен.
@@ -219,7 +223,7 @@ class AutoLift:
 
         try:
             wait = await loop.run_in_executor(
-                None, funpay_client.account.raise_lots, st.game_id,
+                None, client.account.raise_lots, st.game_id,
             )
             # wait — из поля "wait" ответа FunPay; если его нет — 4ч по умолчанию
             wait = int(wait) if wait else 4 * 3600
@@ -280,7 +284,7 @@ class AutoLift:
         while self._running:
             try:
                 cfg = config_manager.settings.auto_lift
-                if cfg.enabled and funpay_client.account:
+                if cfg.enabled:
                     await self._tick()
             except Exception as e:
                 logger.exception(f"AutoLift loop: {e}")
@@ -289,33 +293,38 @@ class AutoLift:
             await asyncio.sleep(30)
 
     async def _tick(self) -> None:
-        # Раз в час обновляем список категорий
-        if not self._states or (time.time() - self._categories_loaded_at) > 3600:
-            await self._refresh_categories()
-
-        if not self._states:
-            return
-
-        # Кого поднимать сейчас?
-        ready = [st for st in self._states.values() if st.can_lift_now()]
-        if not ready:
+        # Поднимаем на всех подключённых (и включённых) аккаунтах
+        clients = [c for c in accounts_manager.enabled_clients() if c.account]
+        if not clients:
             return
 
         antiban = config_manager.settings.antiban
-        raised_now: List[Tuple[str, float]] = []  # (имя, timestamp поднятия)
+        # (имя категории, timestamp, алиас аккаунта)
+        raised_now: List[Tuple[str, float, str]] = []
 
-        for st in ready:
-            ok = await self._try_lift_one(st)
-            if ok:
-                raised_now.append((st.category_name, time.time()))
+        for client in clients:
+            acc = client.index
+            # Раз в час обновляем список категорий этого аккаунта
+            loaded_at = self._categories_loaded_at.get(acc, 0.0)
+            has_states = any(k[0] == acc for k in self._states)
+            if not has_states or (time.time() - loaded_at) > 3600:
+                await self._refresh_categories(client)
 
-            # Антибан-задержка между запросами
-            if antiban.human_like_delays:
-                delay = random.uniform(
-                    antiban.min_delay_ms / 1000,
-                    antiban.max_delay_ms / 1000,
-                )
-                await asyncio.sleep(delay)
+            ready = [st for key, st in self._states.items()
+                     if key[0] == acc and st.can_lift_now()]
+
+            for st in ready:
+                ok = await self._try_lift_one(client, st)
+                if ok:
+                    raised_now.append((st.category_name, time.time(), client.alias))
+
+                # Антибан-задержка между запросами
+                if antiban.human_like_delays:
+                    delay = random.uniform(
+                        antiban.min_delay_ms / 1000,
+                        antiban.max_delay_ms / 1000,
+                    )
+                    await asyncio.sleep(delay)
 
         # Если за этот тик что-то подняли — сразу шлём отчёт в TG
         if raised_now:
@@ -323,7 +332,7 @@ class AutoLift:
 
     # ─── Отчёт в TG ─────────────────────────────────────────────────────────
 
-    async def _send_report(self, raised_now: List[Tuple[str, float]]) -> None:
+    async def _send_report(self, raised_now: List[Tuple[str, float, str]]) -> None:
         """
         Шлёт отчёт в стиле:
             ✅ Успешно поднято категорий: 13
@@ -332,12 +341,15 @@ class AutoLift:
             1. Alan Wake 2 (Last raised: 4ч 2сек ago.)
             2. Albion Online (Last raised: 4ч 2сек ago.)
             ...
+        При нескольких аккаунтах категория помечается алиасом: [acc] Имя.
         """
+        multi = len(accounts_manager.all()) > 1
         lines = [f"✅ <b>Успешно поднято категорий:</b> {len(raised_now)}\n"]
         lines.append("<b>Подробнее:</b>")
-        for i, (name, ts) in enumerate(raised_now[:30], 1):
+        for i, (name, ts, alias) in enumerate(raised_now[:30], 1):
             ago = max(0, int(time.time() - ts))
-            lines.append(f"{i}. {name} (Last raised: {_fmt_time_ago(ago)} ago.)")
+            label = f"[{alias}] {name}" if multi else name
+            lines.append(f"{i}. {label} (Last raised: {_fmt_time_ago(ago)} ago.)")
         if len(raised_now) > 30:
             lines.append(f"... и ещё {len(raised_now) - 30}")
 
@@ -349,40 +361,53 @@ class AutoLift:
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def lift_all_lots() -> str:
-    """Однократно пытается поднять всё что готово. Возвращает текст-отчёт."""
-    if not funpay_client.account:
+    """
+    Однократно пытается поднять всё что готово — на всех подключённых
+    аккаунтах. Возвращает текст-отчёт.
+    """
+    clients = [c for c in accounts_manager.enabled_clients() if c.account]
+    if not clients:
         return "Клиент FunPay не подключён."
 
-    cats = await _fetch_categories_with_lots()
-    if not cats:
-        return "Категорий с лотами не найдено."
-
-    raised = 0
-    skipped = 0
-    errors = 0
     antiban = config_manager.settings.antiban
     loop = asyncio.get_event_loop()
+    multi = len(accounts_manager.all()) > 1
+    report_lines: List[str] = []
 
-    for gid, name in cats:
-        try:
-            await loop.run_in_executor(
-                None, funpay_client.account.raise_lots, gid
-            )
-            raised += 1
-            logger.info(f'✓ Подняты лоты категории "{name}"')
-        except Exception as e:
-            err_type = type(e).__name__
-            if "RaiseError" in err_type:
-                skipped += 1
-            else:
-                errors += 1
-                logger.warning(f'Ошибка для "{name}": {e}')
+    for client in clients:
+        cats = await _fetch_categories_with_lots(client)
+        if not cats:
+            if multi:
+                report_lines.append(f"[{client.alias}] категорий с лотами не найдено")
+            continue
 
-        if antiban.human_like_delays:
-            delay = random.uniform(antiban.min_delay_ms / 1000, antiban.max_delay_ms / 1000)
-            await asyncio.sleep(delay)
+        raised = 0
+        skipped = 0
+        errors = 0
 
-    return f"Поднято: {raised}, в кулдауне: {skipped}, ошибок: {errors}"
+        for gid, name in cats:
+            try:
+                await loop.run_in_executor(
+                    None, client.account.raise_lots, gid
+                )
+                raised += 1
+                logger.info(f'✓ [{client.alias}] Подняты лоты категории "{name}"')
+            except Exception as e:
+                err_type = type(e).__name__
+                if "RaiseError" in err_type:
+                    skipped += 1
+                else:
+                    errors += 1
+                    logger.warning(f'[{client.alias}] Ошибка для "{name}": {e}')
+
+            if antiban.human_like_delays:
+                delay = random.uniform(antiban.min_delay_ms / 1000, antiban.max_delay_ms / 1000)
+                await asyncio.sleep(delay)
+
+        prefix = f"[{client.alias}] " if multi else ""
+        report_lines.append(f"{prefix}Поднято: {raised}, в кулдауне: {skipped}, ошибок: {errors}")
+
+    return "\n".join(report_lines) or "Категорий с лотами не найдено."
 
 
 auto_lift = AutoLift()

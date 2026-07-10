@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 
 from bot.states import SetupStates
 from config.settings import config_manager
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from core.proxy_check import validate_golden_key
 from utils.logger import logger
 
@@ -33,16 +33,17 @@ async def golden_key_received(msg: types.Message, state: FSMContext) -> None:
         await msg.answer(f"❌ {err}\nПопробуйте снова:")
         return
 
-    config_manager.settings.funpay.golden_key = key
-    config_manager.save()
+    # Мультиаккаунт: первый ключ создаёт accounts[0] и делает его активным
+    idx, client = accounts_manager.add_account(key)
 
     status_msg = await msg.answer("✅ <b>Токен принят!</b>\n🚀 Подключаюсь к FunPay...")
 
     # Подключаемся к FunPay
     loop = asyncio.get_event_loop()
-    success, message = await loop.run_in_executor(None, funpay_client.connect)
+    success, message = await loop.run_in_executor(None, client.connect)
 
     if not success:
+        accounts_manager.remove_account(idx)
         await status_msg.edit_text(
             f"❌ Не удалось подключиться к FunPay.\n\n<code>{message}</code>\n\n"
             f"Проверьте golden_key и отправьте снова:"
@@ -53,8 +54,8 @@ async def golden_key_received(msg: types.Message, state: FSMContext) -> None:
     config_manager.settings.setup_completed = True
     config_manager.save()
 
-    balance = funpay_client.get_balance()
-    active = funpay_client.get_active_orders_count()
+    balance = client.get_balance()
+    active = client.get_active_orders_count()
 
     await msg.answer(
         f"🚀 <b>PaltoFunPayBot успешно запущен!</b>\n\n"
@@ -68,5 +69,5 @@ async def golden_key_received(msg: types.Message, state: FSMContext) -> None:
     await state.clear()
 
     # Запускаем поллинг событий FunPay в фоне
-    asyncio.create_task(funpay_client.start_polling())
+    asyncio.create_task(client.start_polling())
     logger.info("Поллинг FunPay запущен.")

@@ -35,7 +35,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager, funpay_client
 from utils.audit_log import audit
 from utils.logger import logger
 
@@ -450,6 +450,9 @@ async def handle_order_paid(order) -> None:
         logger.debug(f"auto_delivery: заказ #{order_id} уже выдан — пропуск (дубль)")
         return
 
+    # Выдаём через аккаунт, на который пришёл заказ (мультиаккаунт)
+    client = accounts_manager.client_for(order)
+
     # ID чата
     chat_id = getattr(order, "chat_id", None) or getattr(order, "buyer_chat_id", None)
     amount = max(1, int(getattr(order, "amount", 1) or 1))
@@ -492,7 +495,7 @@ async def handle_order_paid(order) -> None:
         if not success:
             # Ключи закончились — шлём out_of_stock + автодеактивация
             await loop.run_in_executor(
-                None, funpay_client.send_message, chat_id, cfg.out_of_stock_message
+                None, client.send_message, chat_id, cfg.out_of_stock_message
             )
             logger.warning(f"auto_delivery: лот {lot_id} — ключи закончились")
             await event_bus.emit("delivery_out_of_stock", order)
@@ -507,7 +510,7 @@ async def handle_order_paid(order) -> None:
         # Отправляем ДО пометки «выдано». send_message сам режет длинный текст
         # по 20 строк и делает ретраи; в executor — чтобы ретраи не блокировали
         # event loop (мы всё ещё под локом лота, гонок нет).
-        sent = await loop.run_in_executor(None, funpay_client.send_message, chat_id, text)
+        sent = await loop.run_in_executor(None, client.send_message, chat_id, text)
 
         if not sent:
             # Отправка не подтвердилась: возвращаем вычтенные ключи в файл

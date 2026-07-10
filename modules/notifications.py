@@ -16,10 +16,18 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config.settings import config_manager
 from core.event_bus import Event, event_bus
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from utils.logger import logger
 
 _bot_ref: Optional[Bot] = None
+
+
+def _acc_tag(obj) -> str:
+    """Префикс '[алиас] ' для событий, когда аккаунтов больше одного."""
+    try:
+        return accounts_manager.tag(obj)
+    except Exception:
+        return ""
 
 
 def set_bot(bot: Bot) -> None:
@@ -55,7 +63,7 @@ def _detect_sender_role(message) -> tuple:
     """Возвращает (эмодзи, название_роли)."""
     author = (getattr(message, "author", "") or "").strip()
     author_id = getattr(message, "author_id", None)
-    own_id = config_manager.settings.funpay.account_id
+    own_id = accounts_manager.client_for(message).own_id
 
     if own_id and author_id == own_id:
         return ("🏷", f"Вы (PaltoBot)")
@@ -82,24 +90,28 @@ def _detect_sender_role(message) -> tuple:
 
 # ─── Клавиатура с 4 кнопками ─────────────────────────────────────────────────
 
-def kb_message_actions(chat_id: Any, chat_name: str) -> InlineKeyboardMarkup:
+def kb_message_actions(chat_id: Any, chat_name: str, acc_index: int = 0) -> InlineKeyboardMarkup:
     """
     Клавиатура под уведомлением о сообщении.
 
     Содержит:
       ряд 1: 📨 Ответить · 📝 Шаблоны
       ряд 2: 🔍 Детали · 💬 FunPay: имя_чата
+
+    В callback-данные зашивается токен '<chat_id>@<индекс аккаунта>' —
+    быстрый ответ уйдёт через тот же аккаунт, на который пришло сообщение.
     """
     cid = str(chat_id) if chat_id else "0"
+    tok = f"{cid}@{acc_index}"
     chat_link = _chat_link(cid)
     safe_name = (chat_name or "Чат")[:20]
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📨 Ответить",  callback_data=f"qr:reply:{cid}"),
-            InlineKeyboardButton(text="📝 Шаблоны",   callback_data=f"qr:tpl:{cid}"),
+            InlineKeyboardButton(text="📨 Ответить",  callback_data=f"qr:reply:{tok}"),
+            InlineKeyboardButton(text="📝 Шаблоны",   callback_data=f"qr:tpl:{tok}"),
         ],
         [
-            InlineKeyboardButton(text="🔍 Детали чата",          callback_data=f"qr:info:{cid}"),
+            InlineKeyboardButton(text="🔍 Детали чата",          callback_data=f"qr:info:{tok}"),
             InlineKeyboardButton(text=f"💬 FunPay: {safe_name} ↗", url=chat_link),
         ],
     ])
@@ -174,10 +186,13 @@ async def notify_message(message) -> None:
             return
 
         style = config_manager.settings.notification_style
+        # Мультиаккаунт: свои id/имя и echo-проверка — через аккаунт-источник
+        client = accounts_manager.client_for(message)
         author_id = getattr(message, "author_id", None)
         author_name = getattr(message, "author", None) or ""
-        own_id = config_manager.settings.funpay.account_id
-        own_name = config_manager.settings.funpay.username or ""
+        own_id = client.own_id
+        own_name = (client.acc_cfg.username if client.acc_cfg else
+                    config_manager.settings.funpay.username) or ""
         by_bot = bool(getattr(message, "by_bot", False))
         msg_text = (getattr(message, "text", "") or "")
         msg_chat_id = getattr(message, "chat_id", None) or getattr(message, "node_id", None)
@@ -192,8 +207,7 @@ async def notify_message(message) -> None:
         # Подавляем echo: если этот же текст мы только что отправили в этот же чат
         # через нашего бота — это echo от FunPay, дубль не нужен.
         try:
-            from core.funpay_client import funpay_client
-            if msg_chat_id and funpay_client.is_recent_outgoing(msg_chat_id, msg_text):
+            if msg_chat_id and client.is_recent_outgoing(msg_chat_id, msg_text):
                 logger.info(f"📨 пропуск echo своего сообщения (chat={msg_chat_id})")
                 return
         except Exception:
@@ -231,10 +245,11 @@ async def notify_message(message) -> None:
 
         role_emoji, role_name = _detect_sender_role(message)
 
+        tag = _acc_tag(message)
         if style.compact_mode:
-            header = f"{role_emoji} <b>{role_name}:</b> {body[:120]}"
+            header = f"{tag}{role_emoji} <b>{role_name}:</b> {body[:120]}"
         else:
-            header = f"{role_emoji} <b>{role_name}:</b> {body or '(без текста)'}"
+            header = f"{tag}{role_emoji} <b>{role_name}:</b> {body or '(без текста)'}"
 
         # Имена картинок ссылками (как Example.png на референсе)
         if images:
@@ -244,7 +259,7 @@ async def notify_message(message) -> None:
                 links.append(f'<a href="{img_url}">{fname}</a>')
             header += "\n" + " ".join(links)
 
-        markup = kb_message_actions(chat_id, chat_name)
+        markup = kb_message_actions(chat_id, chat_name, acc_index=client.index)
         first_photo = images[0] if images else None
 
         for uid in recipients:
@@ -272,11 +287,12 @@ async def notify_new_order(order) -> None:
     buyer_id = getattr(order, "buyer_id", None)
     order_id = getattr(order, "id", "?")
 
+    tag = _acc_tag(order)
     if style.compact_mode:
-        text = f"{_e('🆕 ')}Новый заказ #{order_id}: {title} — {price}"
+        text = f"{tag}{_e('🆕 ')}Новый заказ #{order_id}: {title} — {price}"
     else:
         text = (
-            f"{_e('🆕 ')}<b>Новый заказ</b>\n"
+            f"{tag}{_e('🆕 ')}<b>Новый заказ</b>\n"
             f"#{order_id}\n"
             f"📦 {title}\n"
             f"💰 {price}\n"
@@ -290,11 +306,12 @@ async def notify_order_paid(order) -> None:
     if not config_manager.settings.notifications.order_paid:
         return
     style    = config_manager.settings.notification_style
+    client   = accounts_manager.client_for(order)
     order_id = getattr(order, "id", "?")
     price    = getattr(order, "price", "?")
-    text     = f"{_e('💵 ')}<b>Заказ оплачен</b>\n#{order_id}\nСумма: {price}"
-    if style.show_balance_after_order and funpay_client.account:
-        bal   = funpay_client.get_balance()
+    text     = f"{_acc_tag(order)}{_e('💵 ')}<b>Заказ оплачен</b>\n#{order_id}\nСумма: {price}"
+    if style.show_balance_after_order and client.account:
+        bal   = client.get_balance()
         text += f"\n\n💰 Баланс: {bal['rub']:.2f}₽"
     await _send_to_all(text)
 
@@ -303,7 +320,7 @@ async def notify_order_paid(order) -> None:
 async def notify_order_confirmed(order) -> None:
     if not config_manager.settings.notifications.order_confirmed:
         return
-    text = f"{_e('👍 ')}<b>Заказ подтверждён</b>\n#{getattr(order, 'id', '?')}"
+    text = f"{_acc_tag(order)}{_e('👍 ')}<b>Заказ подтверждён</b>\n#{getattr(order, 'id', '?')}"
     await _send_to_all(text)
 
 
@@ -311,7 +328,7 @@ async def notify_order_confirmed(order) -> None:
 async def notify_order_refunded(order) -> None:
     if not config_manager.settings.notifications.order_refunded:
         return
-    text = f"{_e('↩️ ')}<b>Возврат средств</b>\n#{getattr(order, 'id', '?')}"
+    text = f"{_acc_tag(order)}{_e('↩️ ')}<b>Возврат средств</b>\n#{getattr(order, 'id', '?')}"
     await _send_to_all(text)
 
 
@@ -322,7 +339,7 @@ async def notify_review(review) -> None:
     stars    = int(getattr(review, "stars", 0) or 0)
     rev_text = (getattr(review, "text", "") or "")[:200]
     order_id = getattr(review, "order_id", "?")
-    text     = f"{_e('⭐ ')}<b>Новый отзыв</b>\n{'⭐' * stars}\n#{order_id}\n\n{rev_text}"
+    text     = f"{_acc_tag(review)}{_e('⭐ ')}<b>Новый отзыв</b>\n{'⭐' * stars}\n#{order_id}\n\n{rev_text}"
     await _send_to_all(text)
 
 
@@ -332,7 +349,7 @@ async def notify_delivery(order, content: str) -> None:
         return
     snippet = content[:80] + ("..." if len(content) > 80 else "")
     text = (
-        f"{_e('📦 ')}<b>Товар выдан</b>\n"
+        f"{_acc_tag(order)}{_e('📦 ')}<b>Товар выдан</b>\n"
         f"Заказ #{getattr(order, 'id', '?')}\n"
         f"Содержимое: <code>{snippet}</code>"
     )
@@ -364,24 +381,30 @@ async def notify_started(account=None) -> None:
     # Сообщение #1 — факт включения
     await _send_to_all(f"{_e('🚀 ')}<b>PaltoFunPayBot запущен</b>")
 
-    # Сообщение #2 — если есть подключённый аккаунт FunPay
-    name = None
-    if account is not None:
-        name = getattr(account, "username", None)
-    if not name:
-        # Подстраховка — может быть в funpay_client.account
-        try:
-            from core.funpay_client import funpay_client
-            if funpay_client.account:
-                name = getattr(funpay_client.account, "username", None)
-        except Exception:
-            pass
-    if not name:
-        # И ещё — может быть сохранено в конфиге с прошлой сессии
-        name = config_manager.settings.funpay.username or None
+    # Сообщение #2 — перечисляем подключённые аккаунты FunPay
+    names = []
+    try:
+        for cl in accounts_manager.all():
+            n = None
+            if cl.account is not None:
+                n = getattr(cl.account, "username", None)
+            if not n and cl.acc_cfg is not None:
+                n = cl.acc_cfg.username
+            if n:
+                names.append(n)
+    except Exception:
+        pass
+    if not names:
+        if account is not None and getattr(account, "username", None):
+            names = [account.username]
+        elif config_manager.settings.funpay.username:
+            names = [config_manager.settings.funpay.username]
 
-    if name:
-        await _send_to_all(f"Вы используете аккаунт <b>{name}</b>")
+    if len(names) == 1:
+        await _send_to_all(f"Вы используете аккаунт <b>{names[0]}</b>")
+    elif names:
+        listing = ", ".join(f"<b>{n}</b>" for n in names)
+        await _send_to_all(f"Подключены аккаунты: {listing}")
 
 
 @event_bus.on(Event.BOT_STOPPED)

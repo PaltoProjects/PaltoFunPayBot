@@ -1,17 +1,20 @@
 """
 Быстрый ответ из Telegram в FunPay-чат.
 Обрабатывает кнопки под уведомлениями о сообщениях:
-  qr:reply:<chat_id>   — режим ввода ответа
-  qr:tpl:<chat_id>     — показать шаблоны ответов
-  qr:info:<chat_id>    — детали чата
-  qr:mute:<chat_id>    — заглушить на 1ч
-  qr:unmute:<chat_id>  — разглушить
-  qr:send:<chat_id>    — отправить шаблон как ответ
+  qr:reply:<token>   — режим ввода ответа
+  qr:tpl:<token>     — показать шаблоны ответов
+  qr:info:<token>    — детали чата
+  qr:mute:<token>    — заглушить на 1ч
+  qr:unmute:<token>  — разглушить
+  qr:send:<token>    — отправить шаблон как ответ
+
+<token> = '<chat_id>' или '<chat_id>@<индекс аккаунта>' (мультиаккаунт):
+ответ уходит через тот аккаунт, на который пришло сообщение.
 """
 from __future__ import annotations
 
 import html
-from typing import Optional
+from typing import Optional, Tuple
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -19,12 +22,30 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config.settings import config_manager
-from core.funpay_client import funpay_client
+from core.funpay_client import accounts_manager
 from modules.notifications import mute_chat, unmute_chat
 from utils.logger import logger
 from utils.variables import send_with_vars, substitute
 
 router = Router(name="quick_reply")
+
+
+def _parse_token(token: str) -> Tuple[str, int]:
+    """'12345@1' → ('12345', 1); '12345' → ('12345', -1)."""
+    if "@" in token:
+        cid, _, acc = token.partition("@")
+        try:
+            return cid, int(acc)
+        except ValueError:
+            return cid, -1
+    return token, -1
+
+
+def _client_from_token(token: str):
+    """Возвращает (chat_id, клиент нужного аккаунта)."""
+    cid, acc = _parse_token(token)
+    client = accounts_manager.get(acc) if acc >= 0 else None
+    return cid, (client or accounts_manager.active())
 
 
 class QRStates(StatesGroup):
@@ -100,14 +121,15 @@ async def qr_templates(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qr:info:"))
 async def qr_info(c: CallbackQuery) -> None:
-    chat_id = c.data.split(":", 2)[2]
+    token = c.data.split(":", 2)[2]
+    chat_id, client = _client_from_token(token)
     # Пытаемся получить информацию о чате через FunPayAPI
     info_lines = [f"🔍 <b>Детали чата</b>", f"", f"💬 ID чата: <code>{chat_id}</code>"]
 
-    if funpay_client.account:
+    if client.account:
         try:
             # Пробуем получить историю чата через API
-            chat = funpay_client.account.get_chat(int(chat_id))
+            chat = client.account.get_chat(int(chat_id))
             if chat:
                 buyer_name = getattr(chat, "name", None) or getattr(chat, "username", "?")
                 buyer_id   = getattr(chat, "id", None)
@@ -129,8 +151,8 @@ async def qr_info(c: CallbackQuery) -> None:
     ]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔇 Заглушить чат", callback_data=f"qr:mutemenu:{chat_id}"),
-        InlineKeyboardButton(text="❌ Закрыть",       callback_data=f"qr:cancel:{chat_id}"),
+        InlineKeyboardButton(text="🔇 Заглушить чат", callback_data=f"qr:mutemenu:{token}"),
+        InlineKeyboardButton(text="❌ Закрыть",       callback_data=f"qr:cancel:{token}"),
     ]])
 
     await c.message.answer(
@@ -155,8 +177,8 @@ async def qr_mute_menu(c: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("qr:mute:"))
 async def qr_mute(c: CallbackQuery) -> None:
     parts = c.data.split(":")
-    # qr:mute:<chat_id>:<hours>
-    chat_id = parts[2]
+    # qr:mute:<token>:<hours> — мьютим по чистому chat_id (ключи в конфиге)
+    chat_id, _ = _parse_token(parts[2])
     hours   = float(parts[3]) if len(parts) > 3 else 1.0
     mute_chat(chat_id, hours)
     label = f"{int(hours)} ч" if hours < 24 else "24 ч"
@@ -169,7 +191,7 @@ async def qr_mute(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("qr:unmute:"))
 async def qr_unmute(c: CallbackQuery) -> None:
-    chat_id = c.data.split(":", 2)[2]
+    chat_id, _ = _parse_token(c.data.split(":", 2)[2])
     unmute_chat(chat_id)
     await c.answer("🔔 Уведомления включены", show_alert=False)
     try:
@@ -244,7 +266,8 @@ async def _do_send_photo_then_text(message: Message, chat_id: str) -> None:
     import asyncio
     from pathlib import Path
 
-    if not funpay_client.account:
+    cid, client = _client_from_token(chat_id)
+    if not client.account:
         await message.answer("❌ FunPay не подключён — не могу отправить фото.")
         return
 
@@ -264,7 +287,7 @@ async def _do_send_photo_then_text(message: Message, chat_id: str) -> None:
     loop = asyncio.get_event_loop()
     try:
         image_id = await loop.run_in_executor(
-            None, funpay_client.account.upload_image, str(tmp_path)
+            None, client.account.upload_image, str(tmp_path)
         )
     except Exception as e:
         await message.answer(f"❌ Не удалось загрузить фото в FunPay: {e}")
@@ -279,9 +302,9 @@ async def _do_send_photo_then_text(message: Message, chat_id: str) -> None:
     try:
         await loop.run_in_executor(
             None,
-            lambda: funpay_client.account.send_message(int(chat_id), "", image_id=int(image_id)),
+            lambda: client.account.send_message(int(cid), "", image_id=int(image_id)),
         )
-        logger.info(f"QuickReply photo → chat {chat_id} (image_id={image_id})")
+        logger.info(f"QuickReply photo → chat {cid} (image_id={image_id})")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить фото: {e}")
         return
@@ -359,7 +382,9 @@ async def _show_sent_confirmation(message_or_cb_message, chat_id: str, text: str
     from config.settings import config_manager
     from modules.notifications import _chat_link
 
-    own_name = config_manager.settings.funpay.username or "Вы"
+    cid, client = _client_from_token(chat_id)
+    own_name = ((client.acc_cfg.username if client.acc_cfg else None)
+                or config_manager.settings.funpay.username or "Вы")
     snippet = text[:1500]
     if len(text) > 1500:
         snippet += "\n<i>(обрезано)</i>"
@@ -367,8 +392,8 @@ async def _show_sent_confirmation(message_or_cb_message, chat_id: str, text: str
     head = f"📨 <b>Я ({own_name}):</b>"
     body = f"{head}\n{snippet}" if (len(snippet) > 100 or "\n" in snippet) else f"{head} {snippet}"
 
-    chat_link = _chat_link(chat_id)
-    safe_name = (chat_id or "Чат")[:20]
+    chat_link = _chat_link(cid)
+    safe_name = (cid or "Чат")[:20]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📨 Ответить",  callback_data=f"qr:reply:{chat_id}"),
@@ -384,17 +409,22 @@ async def _show_sent_confirmation(message_or_cb_message, chat_id: str, text: str
 
 async def _send_to_funpay(chat_id: str, text: str,
                           username: str = "", chat_name: str = "") -> bool:
-    """Отправляет текст в FunPay-чат с подстановкой всех переменных."""
-    if not funpay_client.account:
+    """
+    Отправляет текст в FunPay-чат с подстановкой всех переменных.
+    chat_id может быть токеном '<cid>@<acc>' — отправка уйдёт через
+    аккаунт, на который пришло исходное сообщение.
+    """
+    cid, client = _client_from_token(chat_id)
+    if not client.account:
         return False
     ok = await send_with_vars(
         text,
-        funpay_client.send_message,
-        chat_id,
-        account=funpay_client.account,
+        client.send_message,
+        cid,
+        account=client.account,
         username=username,
         chat_name=chat_name or username,
     )
     if ok:
-        logger.info(f"QuickReply → chat {chat_id}: {text[:50]}")
+        logger.info(f"QuickReply → chat {cid}: {text[:50]}")
     return ok

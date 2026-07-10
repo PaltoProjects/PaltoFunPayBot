@@ -347,7 +347,8 @@ async def cmd_power_off(msg: types.Message) -> None:
         await msg.answer("⛔ Только для админов."); return
     await msg.answer("🛑 Бот выключается. Чтобы запустить снова — выполните <code>python main.py</code> на сервере.")
     logger.warning(f"Бот выключен админом {msg.from_user.id}")
-    funpay_client.stop()
+    from core.funpay_client import accounts_manager
+    accounts_manager.stop_all()
     # graceful exit
     asyncio.get_event_loop().call_later(1, lambda: os._exit(0))
 

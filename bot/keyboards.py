@@ -327,6 +327,7 @@ def kb_users(admins: int, managers: int) -> InlineKeyboardMarkup:
 
 def kb_system() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="👥 Аккаунты FunPay", callback_data="sys:accounts")
     b.button(text="🔔 Уведомления", callback_data="sys:notifs")
     b.button(text="💬 Вид уведомлений", callback_data="sys:notifs_style")
     b.button(text="🧩 Плагины", callback_data="sys:plugins")
@@ -337,7 +338,7 @@ def kb_system() -> InlineKeyboardMarkup:
     b.button(text="📊 Статус (/sys)", callback_data="sys:status")
     b.button(text="🔄 Проверить обновления", callback_data="sys:updates")
     b.button(text="⬅️ Назад", callback_data="menu:main")
-    b.adjust(2, 2, 2, 2, 1, 1)
+    b.adjust(1, 2, 2, 2, 2, 1, 1)
     return b.as_markup()
 
 
